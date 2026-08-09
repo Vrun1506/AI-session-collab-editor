@@ -1,10 +1,14 @@
 // @ts-check
 /**
- * Folds the shared event log into a transcript.
+ * Folds the shared event log into everything on screen.
  *
  * Replayed and live events run through the same reducer, so a participant who
- * joins ten minutes late sees exactly what everyone else sees. Ordering comes
- * from the relay's `seq`; this view never invents its own.
+ * joins ten minutes late sees exactly what everyone else sees — the transcript,
+ * who is driving, what is queued, what is awaiting approval and who has spent
+ * what. None of that is fetched or pushed as separate state; it is all derived
+ * from the log, which is why it is consistent by construction.
+ *
+ * Ordering comes from the relay's `seq`; this view never invents its own.
  */
 (function () {
   const vscode = acquireVsCodeApi();
@@ -12,14 +16,221 @@
   const transcriptEl = document.getElementById("transcript");
   const participantsEl = document.getElementById("participants");
   const statusEl = document.getElementById("status");
+  const driverbarEl = document.getElementById("driverbar");
+  const approvalsEl = document.getElementById("approvals");
+  const queueEl = document.getElementById("queue");
+  const ledgerEl = document.getElementById("ledger");
+  const sendEl = document.getElementById("send");
   const inputEl = /** @type {HTMLTextAreaElement} */ (
     document.getElementById("input")
   );
   const dotEl = document.getElementById("dot");
 
-  /** id -> {el, kind} for items that get updated in place (streaming text, tool results). */
+  /** id -> {el, kind} for items updated in place (streaming text, tool results). */
   const items = new Map();
   let lastSeq = -1;
+
+  // ---- folded state -------------------------------------------------------
+
+  /** @type {{userId: string, name: string} | null} */
+  let me = null;
+  /** @type {Array<{userId: string, name: string, role: string}>} */
+  let participants = [];
+
+  /** @type {{userId: string, name: string} | null} */
+  let driver = null;
+  /** @type {Array<{userId: string, name: string}>} */
+  let driverRequests = [];
+  /** suggestionId -> {text, author} */
+  const suggestions = new Map();
+  /** requestId -> {toolName, input} for calls still suspended */
+  const approvals = new Map();
+
+  /** promptId -> author, and turnId -> promptId, so a turn's cost has an owner. */
+  const promptAuthors = new Map();
+  const turnPrompts = new Map();
+  /** userId -> {name, costUsd, turns} */
+  const ledger = new Map();
+  let totalCostUsd = 0;
+
+  const isDriver = () => Boolean(me && driver && driver.userId === me.userId);
+
+  // ---- rendering ----------------------------------------------------------
+
+  let renderQueued = false;
+
+  /** Regions are small and rebuilt wholesale; batching keeps replay cheap. */
+  function scheduleRender() {
+    if (renderQueued) return;
+    renderQueued = true;
+    requestAnimationFrame(() => {
+      renderQueued = false;
+      renderDriverBar();
+      renderApprovals();
+      renderQueue();
+      renderLedger();
+      renderComposer();
+    });
+  }
+
+  function button(label, className, onClick, title) {
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.className = className;
+    if (title) b.title = title;
+    b.addEventListener("click", onClick);
+    return b;
+  }
+
+  function renderDriverBar() {
+    driverbarEl.replaceChildren();
+    if (!driver) {
+      driverbarEl.append(text("span", "muted", "nobody is driving"));
+      driverbarEl.append(
+        button("Take the wheel", "primary", () =>
+          vscode.postMessage({ type: "requestDriver" }),
+        ),
+      );
+      return;
+    }
+
+    const driving = isDriver();
+    driverbarEl.append(
+      text("span", "who-drives", driving ? "🎧 You are driving" : `🎧 ${driver.name} is driving`),
+    );
+
+    if (driving) {
+      // Requests are shown to the driver as an offer to hand over, because the
+      // token is only useful if passing it is easier than arguing about it.
+      for (const r of driverRequests) {
+        if (r.userId === driver.userId) continue;
+        driverbarEl.append(
+          button(`Hand to ${r.name}`, "primary", () =>
+            vscode.postMessage({ type: "grantDriver", userId: r.userId }),
+          ),
+        );
+      }
+      driverbarEl.append(
+        button("Release", "", () => vscode.postMessage({ type: "releaseDriver" })),
+      );
+    } else {
+      const asked = driverRequests.some((r) => me && r.userId === me.userId);
+      const offline = !participants.some((p) => p.userId === driver.userId);
+      driverbarEl.append(
+        button(
+          asked ? "Asked to drive…" : offline ? "Take over (offline)" : "Ask to drive",
+          asked ? "" : "primary",
+          () => vscode.postMessage({ type: "requestDriver" }),
+          offline
+            ? "The driver is disconnected, so the token is free to take"
+            : "The driver is asked to hand over",
+        ),
+      );
+    }
+  }
+
+  function renderApprovals() {
+    approvalsEl.replaceChildren();
+    for (const [requestId, a] of approvals) {
+      const card = document.createElement("div");
+      card.className = "approval";
+
+      card.append(text("div", "who", `⏸ Agent wants to run ${a.toolName}`));
+      card.append(text("pre", "args", stringify(a.input)));
+
+      const row = document.createElement("div");
+      row.className = "row";
+      if (isDriver()) {
+        row.append(
+          button("Approve", "primary", () =>
+            vscode.postMessage({ type: "decideApproval", requestId, allow: true }),
+          ),
+        );
+        row.append(
+          button("Deny", "danger", () =>
+            vscode.postMessage({ type: "decideApproval", requestId, allow: false }),
+          ),
+        );
+      } else {
+        row.append(
+          text(
+            "span",
+            "muted",
+            driver
+              ? `waiting for ${driver.name} to decide`
+              : "waiting for someone to take the wheel",
+          ),
+        );
+      }
+      card.append(row);
+      approvalsEl.append(card);
+    }
+  }
+
+  function renderQueue() {
+    queueEl.replaceChildren();
+    if (suggestions.size === 0) return;
+
+    queueEl.append(
+      text("div", "queue-title", `${suggestions.size} suggested`),
+    );
+    for (const [suggestionId, s] of suggestions) {
+      const row = document.createElement("div");
+      row.className = "suggestion";
+      row.append(text("span", "who", s.author.name));
+      row.append(text("span", "body", s.text));
+      if (isDriver()) {
+        row.append(
+          button("Run", "primary", () =>
+            vscode.postMessage({ type: "promoteSuggestion", suggestionId }),
+          ),
+        );
+        row.append(
+          button("Dismiss", "", () =>
+            vscode.postMessage({ type: "dismissSuggestion", suggestionId }),
+          ),
+        );
+      }
+      queueEl.append(row);
+    }
+  }
+
+  function renderLedger() {
+    if (totalCostUsd === 0) {
+      ledgerEl.textContent = "";
+      return;
+    }
+    // Folded from per-turn deltas rather than read off the agent's running
+    // total, which restarts at zero whenever the session is resumed.
+    const parts = [...ledger.values()]
+      .sort((a, b) => b.costUsd - a.costUsd)
+      .slice(0, 3)
+      .map((e) => `${e.name} $${e.costUsd.toFixed(2)}`);
+    ledgerEl.textContent = `$${totalCostUsd.toFixed(2)} · ${parts.join(" · ")}`;
+  }
+
+  function renderComposer() {
+    const driving = isDriver();
+    sendEl.textContent = driving ? "Send" : "Suggest";
+    inputEl.placeholder = driving
+      ? "Prompt the shared agent… (Enter to send, Shift+Enter for newline)"
+      : `Suggest a prompt for ${driver ? driver.name : "the driver"} to run…`;
+  }
+
+  function text(tag, className, content) {
+    const el = document.createElement(tag);
+    if (className) el.className = className;
+    el.textContent = content;
+    return el;
+  }
+
+  function stringify(value) {
+    try {
+      return JSON.stringify(value, null, 1);
+    } catch {
+      return String(value);
+    }
+  }
 
   function actorName(actor) {
     if (actor.kind === "user") return actor.name;
@@ -109,6 +320,10 @@
     return div;
   }
 
+  function meta(line) {
+    transcriptEl.appendChild(addBlock("meta", "", line));
+  }
+
   function apply(event, replay) {
     // The relay is the ordering authority; drop anything we've already folded.
     if (event.seq <= lastSeq) return;
@@ -129,8 +344,14 @@
 
     switch (b.type) {
       case "prompt.submitted": {
-        const el = addBlock("prompt", who, b.text);
-        transcriptEl.appendChild(el);
+        promptAuthors.set(b.promptId, {
+          userId: event.actor.kind === "user" ? event.actor.userId : "agent",
+          name: who,
+        });
+        const header = b.promotedBy
+          ? `${who} · run by ${b.promotedBy.name}`
+          : who;
+        transcriptEl.appendChild(addBlock("prompt", header, b.text));
         break;
       }
 
@@ -163,11 +384,7 @@
         const entry = ensureItem(`tool:${b.toolUseId}`, "tool", () =>
           addBlock("tool", `🔧 ${b.name}`, ""),
         );
-        entry.el.querySelector(".body").textContent = JSON.stringify(
-          b.input,
-          null,
-          1,
-        );
+        entry.el.querySelector(".body").textContent = stringify(b.input);
         break;
       }
 
@@ -181,61 +398,146 @@
         break;
       }
 
-      case "turn.completed": {
-        clearPending();
-        const cost = b.usage.costUsd;
-        const el = addBlock(
-          "meta",
-          "",
-          `turn complete · $${(cost ?? 0).toFixed(4)} · ${b.usage.durationMs ?? "?"}ms`,
-        );
-        transcriptEl.appendChild(el);
-        dotEl.className = "dot";
-        break;
-      }
-
       case "turn.started": {
         dotEl.className = "dot busy";
+        if (b.promptId) turnPrompts.set(b.turnId, b.promptId);
         // Replayed history already contains the outcome; a placeholder would
         // just be a stale spinner in the middle of the transcript.
         if (!replay) showPending();
         break;
       }
 
-      case "turn.interrupted": {
+      case "turn.completed": {
         clearPending();
-        transcriptEl.appendChild(addBlock("meta", "", "turn interrupted"));
+        const cost = b.usage.costUsd ?? 0;
+        creditCost(b.turnId, cost);
+        meta(
+          `turn complete · $${cost.toFixed(4)} · ${b.usage.durationMs ?? "?"}ms`,
+        );
         dotEl.className = "dot";
         break;
       }
 
+      case "turn.interrupted": {
+        clearPending();
+        meta("turn interrupted");
+        dotEl.className = "dot";
+        break;
+      }
+
+      // ---- concurrency control ------------------------------------------
+      case "driver.granted": {
+        driver = { userId: b.userId, name: b.name };
+        driverRequests = driverRequests.filter((r) => r.userId !== b.userId);
+        meta(
+          b.reason === "handoff" && b.from
+            ? `${b.from.name} handed the wheel to ${b.name}`
+            : b.reason === "idle"
+              ? `${b.name} took the wheel (previous driver idle)`
+              : b.reason === "offline"
+                ? `${b.name} took the wheel (previous driver disconnected)`
+                : `${b.name} is driving`,
+        );
+        break;
+      }
+
+      case "driver.released": {
+        if (driver && driver.userId === b.userId) driver = null;
+        meta(`${b.name} released the wheel`);
+        break;
+      }
+
+      case "driver.requested": {
+        if (!driverRequests.some((r) => r.userId === b.userId)) {
+          driverRequests.push({ userId: b.userId, name: b.name });
+        }
+        meta(`${b.name} asked to drive`);
+        break;
+      }
+
+      case "suggestion.queued": {
+        suggestions.set(b.suggestionId, {
+          text: b.text,
+          author: {
+            userId: event.actor.kind === "user" ? event.actor.userId : "agent",
+            name: who,
+          },
+        });
+        break;
+      }
+
+      case "suggestion.promoted": {
+        suggestions.delete(b.suggestionId);
+        break;
+      }
+
+      case "suggestion.dismissed": {
+        suggestions.delete(b.suggestionId);
+        meta(`${who} dismissed a suggestion`);
+        break;
+      }
+
+      case "tool.approval.requested": {
+        approvals.set(b.requestId, { toolName: b.toolName, input: b.input });
+        meta(`⏸ waiting for approval to run ${b.toolName}`);
+        break;
+      }
+
+      case "tool.approval.decided": {
+        approvals.delete(b.requestId);
+        meta(
+          `${b.allow ? "✅" : "⛔"} ${who} ${b.allow ? "approved" : "denied"} the tool call` +
+            (b.reason ? ` — ${b.reason}` : ""),
+        );
+        break;
+      }
+
       case "room.joined": {
-        transcriptEl.appendChild(addBlock("meta", "", `${b.name} joined`));
+        meta(`${b.name} joined`);
         break;
       }
 
       case "room.left": {
-        transcriptEl.appendChild(addBlock("meta", "", `${b.name} left`));
+        meta(`${b.name} left`);
         break;
       }
 
       case "agent.status": {
-        transcriptEl.appendChild(
-          addBlock("meta", "", `agent ${b.state}${b.detail ? ` — ${b.detail}` : ""}`),
-        );
+        meta(`agent ${b.state}${b.detail ? ` — ${b.detail}` : ""}`);
         break;
       }
     }
+
     scrollToEnd();
+    scheduleRender();
+  }
+
+  /** Attribute a turn's cost to whoever's prompt started it. */
+  function creditCost(turnId, cost) {
+    totalCostUsd += cost;
+    const author = promptAuthors.get(turnPrompts.get(turnId));
+    const key = author ? author.userId : "agent";
+    const name = author ? author.name : "Agent";
+    const entry = ledger.get(key) ?? { name, costUsd: 0, turns: 0 };
+    entry.name = name;
+    entry.costUsd += cost;
+    entry.turns += 1;
+    ledger.set(key, entry);
   }
 
   window.addEventListener("message", (e) => {
     const msg = e.data;
-    if (msg.type === "event") apply(msg.event, msg.replay === true);
-    else if (msg.type === "participants") {
-      participantsEl.textContent = msg.participants
+    if (msg.type === "event") {
+      apply(msg.event, msg.replay === true);
+    } else if (msg.type === "identity") {
+      me = { userId: msg.you.userId, name: msg.you.name };
+      scheduleRender();
+    } else if (msg.type === "participants") {
+      participants = msg.participants;
+      participantsEl.textContent = participants
         .map((p) => (p.role === "agent-host" ? "🤖 Agent" : p.name))
         .join(" · ");
+      scheduleRender();
     } else if (msg.type === "status") {
       statusEl.textContent = msg.text;
     }
@@ -244,11 +546,13 @@
   function submit() {
     const text = inputEl.value.trim();
     if (!text) return;
+    // Deliberately the same message whether or not we are driving: the relay
+    // decides, so a stale idea of who holds the token cannot jump the queue.
     vscode.postMessage({ type: "submit", text });
     inputEl.value = "";
   }
 
-  document.getElementById("send").addEventListener("click", submit);
+  sendEl.addEventListener("click", submit);
   document.getElementById("interrupt").addEventListener("click", () => {
     vscode.postMessage({ type: "interrupt" });
   });
@@ -258,4 +562,6 @@
       submit();
     }
   });
+
+  scheduleRender();
 })();

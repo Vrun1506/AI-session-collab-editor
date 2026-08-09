@@ -7,7 +7,7 @@
     "build": "pnpm -r --filter ./packages/protocol build && pnpm -r build",
     "relay": "pnpm --filter @mpa/sync-server start",
     "agent": "pnpm --filter @mpa/agent-host start",
-    "package-ext": "pnpm --filter mpa-vscode build && pnpm --filter mpa-vscode exec vsce package --no-dependencies --allow-missing-repository -o mpa-vscode.vsix",
+    "package-ext": "pnpm --filter mpa-vscode build && pnpm --filter mpa-vscode exec vsce package --no-dependencies --allow-missing-repository -o ../../mpa-vscode.vsix",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test"
   },

@@ -12,6 +12,9 @@ export interface SessionHandlers {
   onEvent(event: SessionEvent, replay: boolean): void;
   onParticipants(participants: Participant[]): void;
   onStatus(text: string): void;
+  /** Who the relay thinks we are — the panel needs it to know whether the
+   *  driver token in the folded log is ours. */
+  onIdentity(you: Participant): void;
 }
 
 export interface SessionConfig {
@@ -24,6 +27,10 @@ export interface SessionConfig {
   agentHostEntry: string;
   workspaceDir: string;
   allowedTools: string;
+  disallowedTools: string;
+  /** Surfaced loudly, unlike `onStatus` — a shared agent that never started is
+   *  not something to leave in a status line. */
+  onFatal(message: string): void;
 }
 
 /**
@@ -66,6 +73,7 @@ export class RoomSession {
     // Detached, because the shared agent must not die with the window that
     // happened to start it — closing a tab should never end everyone else's
     // session. The relay is the only thing the agent-host really belongs to.
+    const startedAt = Date.now();
     this.child = spawn(process.execPath, [this.config.agentHostEntry], {
       env: {
         ...process.env,
@@ -74,21 +82,36 @@ export class RoomSession {
         MPA_CWD: this.config.workspaceDir,
         MPA_RELAY_URL: this.config.relayUrl,
         MPA_ALLOWED_TOOLS: this.config.allowedTools,
+        MPA_DISALLOWED_TOOLS: this.config.disallowedTools,
       },
       stdio: ["ignore", "pipe", "pipe"],
       detached: true,
     });
     this.child.unref();
 
+    // Keep the last thing it said, so an early death can explain itself.
+    let lastError = "";
     this.child.stdout?.on("data", (d: Buffer) =>
       this.handlers.onStatus(d.toString().trim()),
     );
-    this.child.stderr?.on("data", (d: Buffer) =>
-      this.handlers.onStatus(`agent-host: ${d.toString().trim()}`),
+    this.child.stderr?.on("data", (d: Buffer) => {
+      lastError = d.toString().trim();
+      this.handlers.onStatus(`agent-host: ${lastError}`);
+    });
+    this.child.on("error", (err) =>
+      this.config.onFatal(`Could not start the shared agent: ${err.message}`),
     );
-    this.child.on("exit", (code) =>
-      this.handlers.onStatus(`agent-host exited (${code})`),
-    );
+    this.child.on("exit", (code) => {
+      this.handlers.onStatus(`agent-host exited (${code})`);
+      // A clean exit long after startup is someone stopping the agent. Dying
+      // in the first few seconds means it never ran, and that used to show up
+      // only as a puzzling "no agent-host connected" when you tried to prompt.
+      if (code !== 0 && Date.now() - startedAt < 5_000) {
+        this.config.onFatal(
+          `The shared agent exited immediately (code ${code}). ${lastError}`.trim(),
+        );
+      }
+    });
   }
 
   private connect(): void {
@@ -116,6 +139,7 @@ export class RoomSession {
       if (!msg) return;
       switch (msg.type) {
         case "welcome":
+          this.handlers.onIdentity(msg.you);
           this.handlers.onStatus(
             `joined ${msg.roomId} — replayed ${msg.backlog.length} events`,
           );
@@ -180,12 +204,45 @@ export class RoomSession {
     }
   }
 
+  /**
+   * Send text to the room. Whether this becomes a prompt or a queued
+   * suggestion is the relay's call, not ours — see the wire protocol.
+   */
   submitPrompt(text: string): void {
     this.send({ type: "submitPrompt", text });
   }
 
   interrupt(): void {
     this.send({ type: "interrupt" });
+  }
+
+  requestDriver(): void {
+    this.send({ type: "requestDriver" });
+  }
+
+  grantDriver(userId: string): void {
+    this.send({ type: "grantDriver", userId });
+  }
+
+  releaseDriver(): void {
+    this.send({ type: "releaseDriver" });
+  }
+
+  promoteSuggestion(suggestionId: string): void {
+    this.send({ type: "promoteSuggestion", suggestionId });
+  }
+
+  dismissSuggestion(suggestionId: string): void {
+    this.send({ type: "dismissSuggestion", suggestionId });
+  }
+
+  decideApproval(requestId: string, allow: boolean, reason?: string): void {
+    this.send({
+      type: "decideApproval",
+      requestId,
+      allow,
+      ...(reason ? { reason } : {}),
+    });
   }
 
   /**

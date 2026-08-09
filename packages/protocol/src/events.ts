@@ -9,6 +9,13 @@ import { z } from "zod";
  * total ordering and replay-from-seq possible.
  */
 
+/** A participant, in the smallest form worth putting in the log. */
+export const Identity = z.object({
+  userId: z.string(),
+  name: z.string(),
+});
+export type Identity = z.infer<typeof Identity>;
+
 export const Actor = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("user"),
@@ -70,9 +77,14 @@ export const EventBody = z.discriminatedUnion("type", [
     type: z.literal("prompt.submitted"),
     promptId: z.string(),
     text: z.string(),
-    /** Set when this prompt began life as another participant's suggestion,
-     *  so the log credits the author rather than the driver who promoted it. */
-    suggestedBy: z.string().optional(),
+    /**
+     * Set when this prompt began life as another participant's suggestion.
+     * The `actor` stays the original author — the log credits whoever had the
+     * idea, not the driver who happened to hold the token — and this records
+     * who let it through.
+     */
+    promotedBy: Identity.optional(),
+    suggestionId: z.string().optional(),
   }),
   z.object({
     type: z.literal("turn.started"),
@@ -127,12 +139,37 @@ export const EventBody = z.discriminatedUnion("type", [
     byUserId: z.string().nullable(),
   }),
 
-  // ---- reserved for M2+ ---------------------------------------------------
+  // ---- concurrency control (M2) -------------------------------------------
+  /**
+   * Exactly one participant holds the driver token and may prompt the agent
+   * directly. Everyone else suggests. The token lives in the log rather than in
+   * relay memory so it survives a restart along with everything else — and so
+   * "who was driving when this happened" is answerable after the fact.
+   */
   z.object({
     type: z.literal("driver.granted"),
     userId: z.string(),
     name: z.string(),
+    /**
+     * Why the token moved, which is the interesting part when reading back.
+     * `initial` nobody was driving · `handoff` the driver passed it on ·
+     * `idle` taken from a driver who had gone quiet · `offline` taken from a
+     * driver who had disconnected.
+     */
+    reason: z.enum(["initial", "handoff", "idle", "offline"]),
+    from: Identity.nullable().optional(),
   }),
+  z.object({
+    type: z.literal("driver.requested"),
+    userId: z.string(),
+    name: z.string(),
+  }),
+  z.object({
+    type: z.literal("driver.released"),
+    userId: z.string(),
+    name: z.string(),
+  }),
+
   z.object({
     type: z.literal("suggestion.queued"),
     suggestionId: z.string(),
@@ -144,10 +181,21 @@ export const EventBody = z.discriminatedUnion("type", [
     promptId: z.string(),
   }),
   z.object({
+    type: z.literal("suggestion.dismissed"),
+    suggestionId: z.string(),
+  }),
+
+  /**
+   * The shared approval gate. The agent-host suspends inside `canUseTool`
+   * until a decision arrives, so this pair of events brackets a real pause in
+   * the agent's execution rather than merely describing one.
+   */
+  z.object({
     type: z.literal("tool.approval.requested"),
     requestId: z.string(),
     toolName: z.string(),
     input: z.unknown(),
+    turnId: z.string().nullable(),
   }),
   z.object({
     type: z.literal("tool.approval.decided"),
@@ -155,6 +203,8 @@ export const EventBody = z.discriminatedUnion("type", [
     allow: z.boolean(),
     reason: z.string().optional(),
   }),
+
+  // ---- reserved for M3+ ---------------------------------------------------
   z.object({
     type: z.literal("file.changed"),
     path: z.string(),

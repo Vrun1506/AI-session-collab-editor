@@ -31,6 +31,16 @@
         "category": "Multiplayer Agent"
       },
       {
+        "command": "mpa.requestDriver",
+        "title": "Multiplayer Agent: Ask to Drive",
+        "category": "Multiplayer Agent"
+      },
+      {
+        "command": "mpa.releaseDriver",
+        "title": "Multiplayer Agent: Release the Wheel",
+        "category": "Multiplayer Agent"
+      },
+      {
         "command": "mpa.stopAgent",
         "title": "Multiplayer Agent: Stop Shared Agent (ends it for everyone)",
         "category": "Multiplayer Agent"
@@ -47,17 +57,22 @@
         "mpa.displayName": {
           "type": "string",
           "default": "",
-          "description": "Name shown to other participants. Defaults to your OS username."
+          "description": "Name shown to other participants. You are asked for one the first time you join; it is saved per workspace so two windows can be two people."
         },
         "mpa.agentHostEntry": {
           "type": "string",
           "default": "",
-          "description": "Absolute path to agent-host dist/index.js. Defaults to the sibling package in this monorepo."
+          "description": "Absolute path to agent-host dist/index.js. Leave empty to use the sibling package in this monorepo."
         },
         "mpa.allowedTools": {
           "type": "string",
           "default": "Read,Glob,Grep",
-          "description": "Comma-separated tools the shared agent may use. M0 is read-only by design."
+          "description": "Comma-separated tools the shared agent may run without asking. Everything else goes to the room for approval."
+        },
+        "mpa.disallowedTools": {
+          "type": "string",
+          "default": "Write,Edit,MultiEdit,NotebookEdit",
+          "description": "Tools nobody may approve. File writes stay here until M3 routes them through the shared document."
         }
       }
     }

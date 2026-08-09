@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
-import { query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import {
+  query,
+  type HookCallback,
+  type SDKUserMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import {
   DEFAULT_RELAY_URL,
   decodeServer,
@@ -26,28 +30,78 @@ const cwd = process.env.MPA_CWD ?? process.cwd();
 const splitList = (v: string) =>
   v.split(",").map((t) => t.trim()).filter(Boolean);
 
-const allowedTools = splitList(process.env.MPA_ALLOWED_TOOLS ?? "Read,Glob,Grep");
+/**
+ * Tools that run without asking anyone. Reading is safe enough to be worth the
+ * latency saved; everything else goes to the room.
+ *
+ * Note this list is applied by *our* hook, not passed to the SDK as
+ * `allowedTools`. A bare name in `allowedTools` auto-approves the tool before
+ * any callback is consulted, which is precisely the shadowing we need to avoid.
+ */
+const autoApproved = new Set(
+  splitList(process.env.MPA_ALLOWED_TOOLS ?? "Read,Glob,Grep"),
+);
 
 /**
- * `allowedTools` is an auto-approve list, NOT a restriction — anything absent
- * from it still runs once approved, and in M0 there is no approval surface yet.
- * Since a guest's prompt executes tools on the HOST's machine with the host's
- * credentials, the read-only guarantee has to come from an explicit deny list.
+ * Tools nobody may authorise, however much they want to.
  *
- * Write tools land in M3 (once agent writes route through the shared document)
- * and Bash in M2 (once approvals exist), not before.
+ * Until M2 there was nothing to ask, so the read-only guarantee had to come
+ * entirely from this deny list. With the approval gate in place `Bash` and the
+ * network tools move out of here and behind a human decision instead. The
+ * file-writing tools stay denied until M3 routes agent writes through the
+ * shared document — a write that silently clobbers someone's unsaved buffer is
+ * not made safe by approving it.
+ *
+ * It also stays as a backstop: a bug in the gate must not become arbitrary
+ * writes to the host's disk.
  */
 const disallowedTools = splitList(
   process.env.MPA_DISALLOWED_TOOLS ??
-    "Bash,BashOutput,KillShell,Write,Edit,MultiEdit,NotebookEdit,WebFetch,WebSearch",
+    "Write,Edit,MultiEdit,NotebookEdit",
 );
 
-const socket = new WebSocket(relayUrl);
+/**
+ * How long a suspended tool call waits for a human before it gives up.
+ *
+ * Without this an unattended room wedges the agent forever: `canUseTool` has no
+ * deadline of its own, and a promise nobody resolves is indistinguishable from
+ * a hang.
+ */
+const approvalTimeoutMs = Number(process.env.MPA_APPROVAL_TIMEOUT_MS ?? 300_000);
+
 const prompts = new AsyncQueue<SDKUserMessage>();
 const translator = new TurnTranslator();
 
+let socket: WebSocket | undefined;
+let started = false;
+let shuttingDown = false;
+let activeQuery: ReturnType<typeof query> | undefined;
+
+// ---------------------------------------------------------------------------
+// Relay connection
+// ---------------------------------------------------------------------------
+
+const RETRY_DELAYS = [500, 1_000, 2_000, 4_000, 8_000];
+let retries = 0;
+
+/**
+ * Events produced while the relay is unreachable.
+ *
+ * The log is the product, so silently dropping a turn's output because a socket
+ * blipped is not acceptable. The cap exists because an agent mid-answer will
+ * happily outproduce a relay that never comes back; oldest first, since a
+ * dropped delta is superseded by the `assistant.message` that follows it.
+ */
+const outbox: ClientMessage[] = [];
+const OUTBOX_LIMIT = 5_000;
+
 function sendToRelay(msg: ClientMessage): void {
-  if (socket.readyState === WebSocket.OPEN) socket.send(encode(msg));
+  if (socket?.readyState === WebSocket.OPEN) {
+    socket.send(encode(msg));
+    return;
+  }
+  if (outbox.length >= OUTBOX_LIMIT) outbox.shift();
+  outbox.push(msg);
 }
 
 /**
@@ -64,79 +118,237 @@ function publish(body: EventBody): void {
   sendToRelay({ type: "publish", draft: { actor: { kind: "agent" }, body } });
 }
 
-socket.on("open", () => {
-  sendToRelay({
-    type: "hello",
-    roomId,
-    userId: "agent-host",
-    name: "Agent",
-    role: "agent-host",
-    // The host does not replay history; the editors are the readers.
-    sinceSeq: Number.MAX_SAFE_INTEGER,
+function connect(): void {
+  const ws = new WebSocket(relayUrl);
+  socket = ws;
+
+  ws.on("open", () => {
+    retries = 0;
+    ws.send(
+      encode({
+        type: "hello",
+        roomId,
+        userId: "agent-host",
+        name: "Agent",
+        role: "agent-host",
+        // The host does not replay history; the editors are the readers.
+        sinceSeq: Number.MAX_SAFE_INTEGER,
+      }),
+    );
+    if (!started) publish({ type: "agent.status", state: "starting" });
   });
-  publish({ type: "agent.status", state: "starting" });
-  console.log(`[agent-host] room=${roomId} cwd=${cwd}`);
-  // The agent loop starts on `welcome`, not here: the relay tells us whether
-  // this room has a session to resume, and that has to be known before the
-  // query is created.
-});
 
-socket.on("message", (raw) => {
-  const msg = decodeServer(raw.toString());
-  if (!msg) return;
+  ws.on("message", (raw) => {
+    const msg = decodeServer(raw.toString());
+    if (!msg) return;
 
-  switch (msg.type) {
-    case "welcome": {
-      if (started) break;
-      started = true;
-      if (msg.agentSessionId) {
-        console.log(`[agent-host] resuming session ${msg.agentSessionId}`);
+    switch (msg.type) {
+      case "welcome": {
+        // Flush anything produced while offline before anything new lands, so
+        // the room's ordering matches the order the agent actually spoke in.
+        const backlog = outbox.splice(0, outbox.length);
+        for (const queued of backlog) sendToRelay(queued);
+
+        // Tool calls still suspended on a human decision have to be re-asked:
+        // the relay may have restarted and forgotten them, and it answers
+        // idempotently if it has not.
+        for (const [requestId, pending] of pendingApprovals) {
+          sendToRelay({
+            type: "requestApproval",
+            requestId,
+            toolName: pending.toolName,
+            input: pending.input,
+            turnId: pending.turnId,
+          });
+        }
+
+        if (started) break;
+        started = true;
+        if (msg.agentSessionId) {
+          console.log(`[agent-host] resuming session ${msg.agentSessionId}`);
+        }
+        void runAgentLoop(msg.agentSessionId);
+        break;
       }
-      void runAgentLoop(msg.agentSessionId);
-      break;
+      case "runPrompt": {
+        const turnId = randomUUID();
+        translator.startTurn(turnId);
+        publish({ type: "turn.started", turnId, promptId: msg.promptId });
+        prompts.push({
+          type: "user",
+          message: { role: "user", content: msg.text },
+          parent_tool_use_id: null,
+          session_id: "",
+        } as SDKUserMessage);
+        break;
+      }
+      case "doInterrupt": {
+        const turnId = translator.openTurnId;
+        void activeQuery?.interrupt().catch((err: unknown) => {
+          console.error("[agent-host] interrupt failed:", err);
+        });
+        if (turnId) {
+          publish({ type: "turn.interrupted", turnId, byUserId: msg.byUserId });
+        }
+        break;
+      }
+      case "toolDecision": {
+        settleApproval(msg.requestId, msg.allow, msg.reason);
+        break;
+      }
+      case "error": {
+        console.error("[agent-host] relay error:", msg.message);
+        break;
+      }
     }
-    case "runPrompt": {
-      const turnId = randomUUID();
-      translator.startTurn(turnId);
-      publish({ type: "turn.started", turnId, promptId: msg.promptId });
-      prompts.push({
-        type: "user",
-        message: { role: "user", content: msg.text },
-        parent_tool_use_id: null,
-        session_id: "",
-      } as SDKUserMessage);
-      break;
-    }
-    case "doInterrupt": {
-      const turnId = translator.openTurnId;
-      void activeQuery?.interrupt().catch((err: unknown) => {
-        console.error("[agent-host] interrupt failed:", err);
+  });
+
+  ws.on("close", () => {
+    if (shuttingDown) return;
+    // The shared agent must outlive a relay restart. The query itself is
+    // untouched by a dropped socket, so recovery is only a matter of getting
+    // the transcript flowing again.
+    const delay = RETRY_DELAYS[Math.min(retries, RETRY_DELAYS.length - 1)]!;
+    retries++;
+    console.log(
+      `[agent-host] relay unreachable, retrying in ${delay}ms (attempt ${retries})`,
+    );
+    setTimeout(connect, delay).unref?.();
+  });
+
+  ws.on("error", (err) => {
+    console.error("[agent-host] socket error:", err.message);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Shared approval gate
+// ---------------------------------------------------------------------------
+
+interface PendingApproval {
+  toolName: string;
+  input: unknown;
+  turnId: string | null;
+  settle: (decision: { allow: boolean; reason?: string }) => void;
+  timer: NodeJS.Timeout;
+}
+
+const pendingApprovals = new Map<string, PendingApproval>();
+
+function settleApproval(
+  requestId: string,
+  allow: boolean,
+  reason: string | undefined,
+): void {
+  const pending = pendingApprovals.get(requestId);
+  if (!pending) return;
+  pendingApprovals.delete(requestId);
+  clearTimeout(pending.timer);
+  pending.settle({ allow, reason });
+}
+
+/**
+ * Suspends the agent until someone in the room decides.
+ *
+ * This is the milestone's whole point. The pause is real — the agent is
+ * genuinely stopped, not shown a notification after the fact — and the request,
+ * its arguments and the eventual decision all land in the shared log, so every
+ * participant sees the same thing and the transcript answers "who approved
+ * that?" afterwards.
+ *
+ * It runs as a `PreToolUse` hook rather than through `canUseTool`, which was
+ * the obvious choice and the wrong one: measured against this SDK, `canUseTool`
+ * is simply not consulted for `Bash`, so the first version of this gate watched
+ * a guest's prompt run a shell command with nobody asked. The hook fires for
+ * every tool call, which is the property the whole milestone rests on. Re-check
+ * with `packages/agent-host/probe.mjs` before trusting either mechanism on a
+ * new SDK version.
+ */
+async function askTheRoom(
+  toolName: string,
+  input: unknown,
+  signal: AbortSignal,
+): Promise<{ allow: boolean; reason?: string }> {
+  const requestId = randomUUID();
+  const turnId = translator.openTurnId;
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      pendingApprovals.delete(requestId);
+      resolve({
+        allow: false,
+        reason: `No one approved this ${toolName} call within ${Math.round(
+          approvalTimeoutMs / 1000,
+        )}s.`,
       });
-      if (turnId) {
-        publish({ type: "turn.interrupted", turnId, byUserId: msg.byUserId });
-      }
-      break;
-    }
-    case "error": {
-      console.error("[agent-host] relay error:", msg.message);
-      break;
-    }
-  }
-});
+    }, approvalTimeoutMs);
+    timer.unref?.();
 
-socket.on("close", () => {
-  console.log("[agent-host] relay connection closed, shutting down");
-  prompts.close();
-  process.exit(0);
-});
+    pendingApprovals.set(requestId, {
+      toolName,
+      input,
+      turnId,
+      settle: resolve,
+      timer,
+    });
 
-socket.on("error", (err) => {
-  console.error("[agent-host] socket error:", err.message);
-  process.exit(1);
-});
+    // An interrupt must not leave the room staring at a request that can no
+    // longer matter.
+    signal.addEventListener("abort", () => {
+      settleApproval(requestId, false, "Turn was interrupted.");
+    });
 
-let activeQuery: ReturnType<typeof query> | undefined;
-let started = false;
+    sendToRelay({
+      type: "requestApproval",
+      requestId,
+      toolName,
+      input,
+      turnId,
+    });
+  });
+}
+
+const gateToolCall: HookCallback = async (input, _toolUseId, options) => {
+  if (input.hook_event_name !== "PreToolUse") return {};
+  const toolName = input.tool_name;
+  // Reading is cheap, reversible and constant, so waiting on a human for it
+  // would make the session unusable without making it meaningfully safer.
+  if (autoApproved.has(toolName)) return {};
+
+  const decision = await askTheRoom(toolName, input.tool_input, options.signal);
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: decision.allow ? "allow" : "deny",
+      permissionDecisionReason:
+        decision.reason ??
+        (decision.allow
+          ? "Approved in the shared session."
+          : "The room declined this tool call."),
+    },
+  };
+};
+
+// ---------------------------------------------------------------------------
+
+/**
+ * The agent is told where it is and who it is working for.
+ *
+ * Without the first part it guesses root-relative paths and burns a tool call
+ * recovering; without the second it writes as though one person asked, which
+ * reads oddly to the three other people watching.
+ */
+const sharedSessionPrompt = `You are the shared agent in a multiplayer session. \
+Several people are watching this conversation and any of them may prompt you, \
+so prompts in one turn may come from a different person than the last.
+
+The workspace root is ${cwd}. All file paths you use must be relative to that \
+root or absolute beneath it; a leading "/" means the filesystem root, not the \
+project. Prefer Glob or Grep over guessing a path.
+
+Some of your tools pause for a human decision before they run. If a tool call \
+is declined, do not retry it — explain what you wanted to do and why, and let \
+the room respond.`;
 
 async function runAgentLoop(resumeSessionId: string | null): Promise<void> {
   try {
@@ -144,8 +356,22 @@ async function runAgentLoop(resumeSessionId: string | null): Promise<void> {
       prompt: prompts,
       options: {
         cwd,
-        allowedTools,
         disallowedTools,
+        hooks: {
+          // The hook's own timeout has to outlast the human one, or the SDK
+          // gives up on the gate while the room is still looking at it.
+          PreToolUse: [
+            {
+              timeout: Math.ceil(approvalTimeoutMs / 1000) + 30,
+              hooks: [gateToolCall],
+            },
+          ],
+        },
+        systemPrompt: {
+          type: "preset",
+          preset: "claude_code",
+          append: sharedSessionPrompt,
+        },
         // Streams tokens as they arrive so every participant watches the agent
         // think in real time — the whole point of M0.
         includePartialMessages: true,
@@ -170,10 +396,19 @@ async function runAgentLoop(resumeSessionId: string | null): Promise<void> {
   }
 }
 
+console.log(`[agent-host] room=${roomId} cwd=${cwd}`);
+console.log(
+  `[agent-host] auto-approved: ${[...autoApproved].join(", ") || "none"} · ` +
+    `never allowed: ${disallowedTools.join(", ") || "none"} · ` +
+    "everything else asks the room",
+);
+connect();
+
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
+    shuttingDown = true;
     prompts.close();
-    socket.close();
+    socket?.close();
     process.exit(0);
   });
 }

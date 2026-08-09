@@ -42,7 +42,14 @@ export const ClientMessage = z.discriminatedUnion("type", [
     type: z.literal("publish"),
     draft: EventDraft,
   }),
-  /** Editor asks the agent-host to run a prompt. Relay forwards to the host. */
+  /**
+   * Ask the agent to run this text.
+   *
+   * Deliberately one message for everyone: the relay decides whether the
+   * sender holds the driver token and so whether this becomes a prompt or a
+   * queued suggestion. Clients never need to know, which means a stale idea of
+   * who is driving cannot produce a prompt that should have been a suggestion.
+   */
   z.object({
     type: z.literal("submitPrompt"),
     text: z.string().min(1),
@@ -50,6 +57,39 @@ export const ClientMessage = z.discriminatedUnion("type", [
   /** Anyone may interrupt, by design — a deadlocked room is worse than a
    *  cancelled turn. */
   z.object({ type: z.literal("interrupt") }),
+
+  // ---- driver token (M2) ---------------------------------------------------
+  /** Ask to drive. Granted at once if nobody is driving, or if the current
+   *  driver is disconnected or has gone idle; otherwise it waits on them. */
+  z.object({ type: z.literal("requestDriver") }),
+  /** Current driver hands the token to a specific participant. */
+  z.object({ type: z.literal("grantDriver"), userId: z.string() }),
+  /** Current driver gives up the token; the longest-waiting requester takes it. */
+  z.object({ type: z.literal("releaseDriver") }),
+
+  // ---- suggestion queue (M2) -----------------------------------------------
+  z.object({ type: z.literal("promoteSuggestion"), suggestionId: z.string() }),
+  z.object({ type: z.literal("dismissSuggestion"), suggestionId: z.string() }),
+
+  // ---- approval gate (M2) --------------------------------------------------
+  /** agent-host -> relay: a tool call is suspended pending a human decision.
+   *  Re-sending the same `requestId` is safe and is how the host recovers a
+   *  pending gate after reconnecting. */
+  z.object({
+    type: z.literal("requestApproval"),
+    requestId: z.string(),
+    toolName: z.string(),
+    input: z.unknown(),
+    turnId: z.string().nullable(),
+  }),
+  /** Driver -> relay: allow or deny a suspended tool call. */
+  z.object({
+    type: z.literal("decideApproval"),
+    requestId: z.string(),
+    allow: z.boolean(),
+    reason: z.string().optional(),
+  }),
+
   z.object({ type: z.literal("ping") }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
@@ -91,6 +131,13 @@ export const ServerMessage = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("doInterrupt"),
     byUserId: z.string(),
+  }),
+  /** Relay -> agent-host only: releases a suspended `canUseTool` call. */
+  z.object({
+    type: z.literal("toolDecision"),
+    requestId: z.string(),
+    allow: z.boolean(),
+    reason: z.string().optional(),
   }),
   z.object({ type: z.literal("pong") }),
   z.object({ type: z.literal("error"), message: z.string() }),

@@ -22,8 +22,19 @@ header {
   flex: 0 0 auto;
 }
 
+.spacer {
+  flex: 1 1 auto;
+}
+
+.ledger {
+  font-size: 0.8em;
+  opacity: 0.7;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 #participants {
-  flex: 1;
+  flex: 0 1 auto;
   font-size: 0.9em;
   opacity: 0.85;
   overflow: hidden;
@@ -162,24 +173,133 @@ textarea:focus {
   outline: 1px solid var(--vscode-focusBorder);
 }
 
+/* Secondary by default; the one action that matters in a row gets `.primary`,
+   so an approval card never has two equally-weighted buttons. */
 button {
   padding: 4px 12px;
   border: none;
   border-radius: 4px;
   cursor: pointer;
-  color: var(--vscode-button-foreground);
-  background: var(--vscode-button-background);
   font-family: inherit;
+  font-size: 0.85em;
+  color: var(--vscode-button-secondaryForeground);
+  background: var(--vscode-button-secondaryBackground);
 }
 
 button:hover {
+  background: var(--vscode-button-secondaryHoverBackground);
+}
+
+button.primary {
+  color: var(--vscode-button-foreground);
+  background: var(--vscode-button-background);
+}
+
+button.primary:hover {
   background: var(--vscode-button-hoverBackground);
 }
 
-#interrupt {
-  background: var(--vscode-button-secondaryBackground);
-  color: var(--vscode-button-secondaryForeground);
+button.danger {
+  color: var(--vscode-button-foreground);
+  background: var(--vscode-inputValidation-errorBorder, #d13438);
+}
+
+#send {
+  color: var(--vscode-button-foreground);
+  background: var(--vscode-button-background);
+  font-size: inherit;
+}
+
+#send:hover {
+  background: var(--vscode-button-hoverBackground);
+}
+
+/* ---- driver token, approvals, suggestion queue -------------------------- */
+
+.driverbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--vscode-panel-border);
   font-size: 0.85em;
+}
+
+.who-drives {
+  font-weight: 600;
+}
+
+.muted {
+  opacity: 0.65;
+}
+
+/* A suspended tool call is the one thing on screen that is actually blocking
+   the agent, so it sits above the transcript rather than scrolling away in it. */
+.approval {
+  margin: 8px 12px 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--vscode-editorWidget-background);
+  border-left: 3px solid var(--vscode-charts-yellow, #d29922);
+  flex: 0 0 auto;
+}
+
+.approval .who {
+  font-size: 0.85em;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.approval .args {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: var(--vscode-textCodeBlock-background);
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.85em;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.approval .row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.queue-title {
+  padding: 8px 12px 2px;
+  font-size: 0.78em;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.6;
+}
+
+.suggestion {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 12px 4px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: var(--vscode-textBlockQuote-background);
+  border-left: 3px solid var(--vscode-charts-blue, #4f9cf9);
+  font-size: 0.88em;
+}
+
+.suggestion .who {
+  opacity: 0.7;
+  flex: 0 0 auto;
+}
+
+.suggestion .body {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 #status {

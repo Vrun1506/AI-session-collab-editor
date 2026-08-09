@@ -182,6 +182,142 @@ test("tracks participants and detects a single agent-host", () => {
   assert.equal(room.isEmpty(), false);
 });
 
+// ---------------------------------------------------------------------------
+// Folded state: the queue and the approval gate are derived, never stored
+// ---------------------------------------------------------------------------
+
+const bob: EventDraft["actor"] = { kind: "user", userId: "u-bob", name: "Bob" };
+
+function queueSuggestion(room: Room, suggestionId: string, text: string): void {
+  room.append({ actor: bob, body: { type: "suggestion.queued", suggestionId, text } });
+}
+
+test("suggestions queue in order and carry their author", () => {
+  const room = new Room("r");
+  queueSuggestion(room, "s1", "use zod, not manual checks");
+  queueSuggestion(room, "s2", "and add a test");
+
+  const queued = room.listSuggestions();
+  assert.deepEqual(
+    queued.map((s) => s.text),
+    ["use zod, not manual checks", "and add a test"],
+  );
+  // Attribution is the point: promotion later credits Bob, not the driver.
+  assert.deepEqual(queued[0]!.author, { userId: "u-bob", name: "Bob" });
+});
+
+test("promoting or dismissing takes a suggestion out of the queue", () => {
+  const room = new Room("r");
+  queueSuggestion(room, "s1", "one");
+  queueSuggestion(room, "s2", "two");
+
+  room.append({
+    actor: agent,
+    body: { type: "suggestion.promoted", suggestionId: "s1", promptId: "p1" },
+  });
+  room.append({
+    actor: bob,
+    body: { type: "suggestion.dismissed", suggestionId: "s2" },
+  });
+
+  assert.deepEqual(room.listSuggestions(), []);
+  assert.equal(room.getSuggestion("s1"), undefined);
+});
+
+test("an approval stays pending until it is decided", () => {
+  const room = new Room("r");
+  room.append({
+    actor: agent,
+    body: {
+      type: "tool.approval.requested",
+      requestId: "req-1",
+      toolName: "Bash",
+      input: { command: "npm test" },
+      turnId: "t1",
+    },
+  });
+
+  assert.equal(room.listPendingApprovals().length, 1);
+  assert.equal(room.getApproval("req-1")?.decision, null);
+
+  room.append({
+    actor: bob,
+    body: { type: "tool.approval.decided", requestId: "req-1", allow: true },
+  });
+
+  assert.deepEqual(room.listPendingApprovals(), []);
+  assert.deepEqual(room.getApproval("req-1")?.decision, {
+    allow: true,
+    reason: undefined,
+  });
+});
+
+test("re-requesting the same approval does not duplicate it", () => {
+  const room = new Room("r");
+  const ask: EventDraft = {
+    actor: agent,
+    body: {
+      type: "tool.approval.requested",
+      requestId: "req-1",
+      toolName: "Bash",
+      input: { command: "ls" },
+      turnId: null,
+    },
+  };
+  room.append(ask);
+  room.append(ask);
+
+  // The agent-host re-asks after reconnecting; the room must not grow a second
+  // pending gate for a single suspended tool call.
+  assert.equal(room.listPendingApprovals().length, 1);
+});
+
+test("the driver token folds from the log", () => {
+  const room = new Room("r");
+  assert.equal(room.driver, null);
+
+  room.append({
+    actor: { kind: "system" },
+    body: {
+      type: "driver.granted",
+      userId: "u-alice",
+      name: "Alice",
+      reason: "initial",
+      from: null,
+    },
+  });
+  assert.equal(room.isDriver("u-alice"), true);
+  assert.equal(room.isDriver("u-bob"), false);
+
+  room.append({
+    actor: bob,
+    body: { type: "driver.requested", userId: "u-bob", name: "Bob" },
+  });
+  assert.deepEqual(room.pendingDriverRequests(), [
+    { userId: "u-bob", name: "Bob" },
+  ]);
+
+  room.append({
+    actor: { kind: "system" },
+    body: {
+      type: "driver.granted",
+      userId: "u-bob",
+      name: "Bob",
+      reason: "handoff",
+      from: { userId: "u-alice", name: "Alice" },
+    },
+  });
+  // Being granted the token clears the request that asked for it.
+  assert.equal(room.isDriver("u-bob"), true);
+  assert.deepEqual(room.pendingDriverRequests(), []);
+
+  room.append({
+    actor: bob,
+    body: { type: "driver.released", userId: "u-bob", name: "Bob" },
+  });
+  assert.equal(room.driver, null);
+});
+
 test("the log survives every participant leaving", () => {
   const room = new Room("r");
   room.addParticipant({ userId: "u1", name: "Alice", role: "editor" });

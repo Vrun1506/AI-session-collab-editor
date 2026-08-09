@@ -8,7 +8,7 @@ log with real concurrency control**. Everything a client shows is derived state
 folded from that log, so someone joining ten minutes late sees exactly what
 everyone else sees.
 
-Status: **M1 complete** (see `Milestones` below).
+Status: **M2 complete** (see `Milestones` below).
 
 ## Architecture
 
@@ -62,16 +62,75 @@ window, **Multiplayer Agent: Join Session** with the same room name in another.
 
 ### Without VS Code
 
-The headless client reproduces the whole M0 scenario and is the fastest way to
-check ordering, streaming and late-join:
+The headless client reproduces the whole scenario and is the fastest way to
+check ordering, streaming, late-join and the concurrency rules:
 
 ```bash
 MPA_ROOM=demo MPA_CWD=/path/to/project node packages/agent-host/dist/index.js &
-MPA_ROOM=demo node packages/sync-server/dist/test-client.js bob &          # observer
-MPA_ROOM=demo node packages/sync-server/dist/test-client.js alice "your prompt"
+
+# Alice joins first, so she gets the driver token. She runs other people's
+# suggestions and approves suspended tool calls.
+MPA_ROOM=demo MPA_AUTOPROMOTE=1 MPA_AUTOAPPROVE=1 \
+  node packages/sync-server/dist/test-client.js alice &
+
+# Bob is not driving, so this text becomes a suggestion, not a prompt.
+MPA_ROOM=demo node packages/sync-server/dist/test-client.js bob \
+  "Run the shell command 'git status --short' and tell me the output."
 ```
 
-Bob sees Alice's prompt, the live token stream, every tool call and the cost.
+Bob sees his own suggestion promoted, the prompt attributed back to *him*, the
+live token stream, the tool call suspended for approval, Alice's decision, and
+the cost. Swap `MPA_AUTOAPPROVE=1` for `MPA_AUTODENY=1` to watch the agent get
+refused. `MPA_DRIVE=1` asks for the token on join.
+
+## Concurrency control
+
+Exactly one participant holds the **driver token** and may prompt the agent
+directly. Everyone else **suggests**; the driver runs or dismisses each
+suggestion, and a promoted prompt is attributed in the log to whoever had the
+idea, not to whoever pressed the button.
+
+Clients send the same message either way — the relay decides whether it is a
+prompt or a suggestion — so a stale idea of who is driving cannot jump the
+queue.
+
+The token is not a lock. It moves without the driver's consent in exactly the
+two cases where waiting for them would deadlock the room:
+
+| Situation | What happens |
+| --- | --- |
+| Nobody is driving | First editor to join, or to ask, takes it |
+| Driver asked to hand over | They see the request and pass it explicitly |
+| Driver has disconnected | Anyone may take it; a lone survivor is given it |
+| Driver has gone quiet | Taken after `MPA_DRIVER_IDLE_MS` (default 120s) |
+
+`interrupt()` is available to **everyone** regardless of the token: a deadlocked
+room is worse than a cancelled turn.
+
+The rules live in `packages/sync-server/src/policy.ts`, apart from the socket
+handling, because they are the actual product decision here.
+
+## The approval gate
+
+Anything outside `MPA_ALLOWED_TOOLS` suspends the agent and asks the room.
+Every participant sees the pending call **with its arguments**; only the driver
+decides; everyone sees who decided, and the transcript still says so tomorrow.
+
+The pause is real — the agent is genuinely stopped, not notified afterwards.
+
+> **This is implemented as a `PreToolUse` hook, not `canUseTool`.** Measured
+> against this SDK, `canUseTool` is *not* consulted for `Bash`: the first
+> version of this gate watched a guest's prompt run a shell command with nobody
+> asked. `packages/agent-host/probe-gate.mjs` is how to check, and should be run
+> after any SDK upgrade:
+>
+> ```bash
+> cd packages/agent-host && node probe-gate.mjs deny   # must NOT execute
+> ```
+
+A suspended call is idempotent on its request id, so the agent-host re-asks
+safely after a reconnect, and times out (`MPA_APPROVAL_TIMEOUT_MS`, default 5
+minutes) rather than wedging an unattended room forever.
 
 ## Persistence
 
@@ -96,33 +155,53 @@ node packages/sync-server/dist/test-client.js a "Remember the codeword PLATYPUS.
 node packages/sync-server/dist/test-client.js b "What was the codeword?"
 ```
 
-Note the SDK's cumulative session cost resets on resume. Per-turn costs stay
-correct because they are computed as deltas; only the running session total
-restarts.
+The driver token, the suggestion queue and any undecided approvals come back
+too — all of it is folded from the log rather than stored beside it, so it
+survives for free and stays consistent with what clients render.
 
-Editors reconnect automatically with backoff and rejoin at their last seen
-`seq`, so only missed events replay.
+Everything reconnects with backoff and rejoins at its last seen `seq`, so only
+missed events replay. That includes the **agent-host**: the shared agent has to
+outlive a relay restart, and its own output is buffered while the relay is away
+rather than dropped.
+
+The SDK's cumulative session cost resets on resume, so it is not used. Room and
+per-participant totals are folded from per-turn deltas instead, and each turn's
+cost is charged to whoever's prompt started it.
 
 ## Safety note
 
 In host-laptop mode a **guest's prompt runs tools on the host's machine with the
-host's credentials**. `allowedTools` is an auto-approve list, *not* a
-restriction — the read-only guarantee comes from `MPA_DISALLOWED_TOOLS`, which
-denies `Bash`/`Write`/`Edit` and friends by default. Do not relax it before the
-M2 approval gate exists.
+host's credentials.** Three layers, in order:
+
+1. `MPA_ALLOWED_TOOLS` (default `Read,Glob,Grep`) runs without asking. Reading
+   is cheap and reversible; waiting on a human for it would make the session
+   unusable without making it safer.
+2. Everything else **asks the room** and blocks until the driver decides.
+3. `MPA_DISALLOWED_TOOLS` (default `Write,Edit,MultiEdit,NotebookEdit`) can be
+   approved by nobody. File writes stay here until M3 routes them through the
+   shared document — a write that silently clobbers someone's unsaved buffer is
+   not made safe by approving it.
+
+Layer 3 is also a backstop: a bug in layer 2 must not become arbitrary writes to
+the host's disk.
+
+Note that `allowedTools` is deliberately **not** passed to the SDK. A bare tool
+name there auto-approves it before any callback runs, which is exactly the
+shadowing the gate has to avoid — the SDK warns about this, and it is why layer
+1 is applied by our own hook.
 
 ## Milestones
 
 - **M0 ✅** streaming shared session: everyone watches one agent live
 - **M1 ✅** durable log, session resume, reconnection
-- **M2** driver token, suggestion queue, shared approval gate via `canUseTool`
+- **M2 ✅** driver token, suggestion queue, shared approval gate
 - **M3** CRDT buffers, agent writes routed into the shared document
 - **M4** checkpoint rewind, session fork, audit export
 
 ## Tests and measurement
 
 ```bash
-pnpm test        # relay ordering, replay and compaction invariants
+pnpm test        # ordering, replay, compaction, folded state, driver policy
 pnpm typecheck
 ```
 
@@ -134,7 +213,10 @@ pnpm typecheck
 node tools/count-frames.mjs "In exactly 200 words, explain event sourcing."
 ```
 
-It exists because an assumption cost real work. A buffering layer was added to
+`packages/agent-host/probe-gate.mjs` checks that a denied tool call really does
+not execute — see "The approval gate" above.
+
+`count-frames.mjs` exists because an assumption cost real work. A buffering layer was added to
 the agent-host to coalesce "per-token" deltas; measurement showed this SDK
 already delivers ~260-character chunks (about five per response), so the frame
 count was **identical** with and without it and the buffering only added
