@@ -3,6 +3,10 @@ dist/
 out/
 *.vsix
 *.log
+# Persisted session logs — durable on purpose, but local to a machine.
+*.db
+*.db-wal
+*.db-shm
 .DS_Store
 .env
 .env.local

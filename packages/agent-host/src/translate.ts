@@ -48,11 +48,6 @@ export class TurnTranslator {
     return this.turnId;
   }
 
-  /** Cost accounting resets when the underlying session does. */
-  resetCost(): void {
-    this.lastTotalCostUsd = 0;
-  }
-
   translate(msg: SDKMessage): EventBody[] {
     const turnId = this.turnId ?? "orphan";
     const out: EventBody[] = [];

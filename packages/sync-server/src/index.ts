@@ -9,6 +9,7 @@ import {
   type ServerMessage,
 } from "@mpa/protocol";
 import { Room } from "./room.js";
+import { MemoryEventStore, SqliteEventStore, type EventStore } from "./store.js";
 
 interface Peer {
   socket: WebSocket;
@@ -16,13 +17,20 @@ interface Peer {
   participant: Participant;
 }
 
+// `:memory:` keeps the old ephemeral behaviour for throwaway runs and tests.
+const dbPath = process.env.MPA_DB ?? "mpa-sessions.db";
+const store: EventStore =
+  dbPath === ":memory:" ? new MemoryEventStore() : new SqliteEventStore(dbPath);
+
 const rooms = new Map<string, Room>();
 const peers = new Map<WebSocket, Peer>();
 
 function getRoom(roomId: string): Room {
   let room = rooms.get(roomId);
   if (!room) {
-    room = new Room(roomId);
+    // Constructing a Room reads the stored high-water mark, so a room that
+    // existed before a restart resumes its numbering rather than colliding.
+    room = new Room(roomId, store);
     rooms.set(roomId, room);
   }
   return room;
@@ -107,6 +115,7 @@ wss.on("connection", (socket) => {
           participants: room.listParticipants(),
           backlog,
           latestSeq,
+          agentSessionId: room.agentSessionId,
         });
 
         if (msg.role === "editor") {
@@ -127,6 +136,12 @@ wss.on("connection", (socket) => {
       }
 
       case "publish": {
+        // The agent reports its SDK session id when it initialises; remember
+        // it so the room can be resumed with context after a restart.
+        const body = msg.draft.body;
+        if (body.type === "agent.status" && body.sessionId) {
+          getRoom(peer!.roomId).rememberAgentSession(body.sessionId);
+        }
         publish(peer!.roomId, msg.draft);
         return;
       }

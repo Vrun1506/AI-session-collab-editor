@@ -76,7 +76,9 @@ socket.on("open", () => {
   });
   publish({ type: "agent.status", state: "starting" });
   console.log(`[agent-host] room=${roomId} cwd=${cwd}`);
-  void runAgentLoop();
+  // The agent loop starts on `welcome`, not here: the relay tells us whether
+  // this room has a session to resume, and that has to be known before the
+  // query is created.
 });
 
 socket.on("message", (raw) => {
@@ -84,6 +86,15 @@ socket.on("message", (raw) => {
   if (!msg) return;
 
   switch (msg.type) {
+    case "welcome": {
+      if (started) break;
+      started = true;
+      if (msg.agentSessionId) {
+        console.log(`[agent-host] resuming session ${msg.agentSessionId}`);
+      }
+      void runAgentLoop(msg.agentSessionId);
+      break;
+    }
     case "runPrompt": {
       const turnId = randomUUID();
       translator.startTurn(turnId);
@@ -125,8 +136,9 @@ socket.on("error", (err) => {
 });
 
 let activeQuery: ReturnType<typeof query> | undefined;
+let started = false;
 
-async function runAgentLoop(): Promise<void> {
+async function runAgentLoop(resumeSessionId: string | null): Promise<void> {
   try {
     activeQuery = query({
       prompt: prompts,
@@ -137,6 +149,11 @@ async function runAgentLoop(): Promise<void> {
         // Streams tokens as they arrive so every participant watches the agent
         // think in real time — the whole point of M0.
         includePartialMessages: true,
+        // Resuming restores what the agent already knows about this room, so a
+        // relay or host restart does not send it back to a blank slate. The
+        // session file is local to this machine; if it has gone, the SDK
+        // starts fresh and the transcript still replays from the log.
+        ...(resumeSessionId ? { resume: resumeSessionId } : {}),
       },
     });
 

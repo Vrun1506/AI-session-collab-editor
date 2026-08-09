@@ -67,6 +67,13 @@ export const ServerMessage = z.discriminatedUnion("type", [
     /** Backlog since the requested cursor — this is what makes late-join free. */
     backlog: z.array(SessionEvent),
     latestSeq: z.number().int(),
+    /**
+     * The Agent SDK session this room was last served by, if any. Sent to a
+     * starting agent-host so it can resume with the context it already built
+     * instead of rereading the world. Persisting the log restores the
+     * transcript; this restores the agent's memory of it.
+     */
+    agentSessionId: z.string().nullable(),
   }),
   z.object({ type: z.literal("event"), event: SessionEvent }),
   z.object({

@@ -3,6 +3,7 @@ import type {
   Participant,
   SessionEvent,
 } from "@mpa/protocol";
+import { MemoryEventStore, type EventStore } from "./store.js";
 
 /**
  * Room state, kept free of any transport concerns so the ordering and replay
@@ -10,28 +11,35 @@ import type {
  * and nowhere else, which is what guarantees every peer folds the same log in
  * the same order.
  *
- * M0 keeps the log in memory. M1 swaps this for SQLite-backed storage behind
- * the same interface.
+ * Events go to an `EventStore`; the default is in-memory so tests need no
+ * database, while the relay passes a SQLite-backed one so a restart does not
+ * destroy the session. Participants deliberately stay in memory — presence is
+ * ephemeral and should not survive a restart.
  */
 export class Room {
   readonly id: string;
-  private readonly events: SessionEvent[] = [];
+  private readonly store: EventStore;
+  private nextSeq: number;
   private readonly participants = new Map<string, Participant>();
 
-  constructor(id: string) {
+  constructor(id: string, store: EventStore = new MemoryEventStore()) {
     this.id = id;
+    this.store = store;
+    // Continue the numbering of whatever history already exists on disk, so
+    // sequence numbers stay unique and monotonic across restarts.
+    this.nextSeq = store.latestSeq(id) + 1;
   }
 
-  /** Stamp a draft with the next sequence number and record it. */
+  /** Stamp a draft with the next sequence number and record it durably. */
   append(draft: EventDraft): SessionEvent {
     const event: SessionEvent = {
-      seq: this.events.length,
+      seq: this.nextSeq++,
       roomId: this.id,
       ts: Date.now(),
       actor: draft.actor,
       body: draft.body,
     };
-    this.events.push(event);
+    this.store.append(event);
     return event;
   }
 
@@ -40,8 +48,7 @@ export class Room {
    * is how a late joiner reconstructs the session from nothing.
    */
   since(sinceSeq: number): SessionEvent[] {
-    if (sinceSeq < 0) return [...this.events];
-    return this.events.slice(sinceSeq + 1);
+    return this.store.since(this.id, sinceSeq);
   }
 
   /**
@@ -76,11 +83,20 @@ export class Room {
   }
 
   get latestSeq(): number {
-    return this.events.length - 1;
+    return this.nextSeq - 1;
   }
 
   get size(): number {
-    return this.events.length;
+    return this.nextSeq;
+  }
+
+  /** The Agent SDK session backing this room, if one has been recorded. */
+  get agentSessionId(): string | null {
+    return this.store.getAgentSessionId(this.id);
+  }
+
+  rememberAgentSession(sessionId: string): void {
+    this.store.setAgentSessionId(this.id, sessionId);
   }
 
   addParticipant(p: Participant): void {

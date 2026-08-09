@@ -8,7 +8,7 @@ log with real concurrency control**. Everything a client shows is derived state
 folded from that log, so someone joining ten minutes late sees exactly what
 everyone else sees.
 
-Status: **M0 complete** (see `Milestones` below).
+Status: **M1 complete** (see `Milestones` below).
 
 ## Architecture
 
@@ -73,6 +73,36 @@ MPA_ROOM=demo node packages/sync-server/dist/test-client.js alice "your prompt"
 
 Bob sees Alice's prompt, the live token stream, every tool call and the cost.
 
+## Persistence
+
+The relay writes every event to SQLite (`MPA_DB`, default `mpa-sessions.db`;
+set `:memory:` for throwaway runs). This uses Node 22's built-in `node:sqlite`,
+so there is **no native dependency to compile** — the API is still marked
+experimental, which is the tradeoff.
+
+Two separate things survive a restart, and both are needed:
+
+- **The transcript**, from the event log. `Room` reads the stored high-water
+  mark on construction, so sequence numbers continue rather than collide.
+- **The agent's memory**, via the SDK `session_id` recorded per room and passed
+  to `query({ resume })`. Without this you would restore the history but face
+  an agent that had forgotten all of it.
+
+Verify both at once:
+
+```bash
+node packages/sync-server/dist/test-client.js a "Remember the codeword PLATYPUS."
+# kill the relay AND the agent-host, restart both
+node packages/sync-server/dist/test-client.js b "What was the codeword?"
+```
+
+Note the SDK's cumulative session cost resets on resume. Per-turn costs stay
+correct because they are computed as deltas; only the running session total
+restarts.
+
+Editors reconnect automatically with backoff and rejoin at their last seen
+`seq`, so only missed events replay.
+
 ## Safety note
 
 In host-laptop mode a **guest's prompt runs tools on the host's machine with the
@@ -84,7 +114,7 @@ M2 approval gate exists.
 ## Milestones
 
 - **M0 ✅** streaming shared session: everyone watches one agent live
-- **M1** persistent log, late-join replay from seq, presence/cursors
+- **M1 ✅** durable log, session resume, reconnection
 - **M2** driver token, suggestion queue, shared approval gate via `canUseTool`
 - **M3** CRDT buffers, agent writes routed into the shared document
 - **M4** checkpoint rewind, session fork, audit export

@@ -34,10 +34,20 @@ export interface SessionConfig {
  * which is what keeps the cloud-sandbox migration a matter of not spawning
  * this child.
  */
+/** Backoff schedule for reconnection, in milliseconds. */
+const RETRY_DELAYS = [500, 1_000, 2_000, 4_000, 8_000];
+
 export class RoomSession {
   private socket: WebSocket | undefined;
   private child: ChildProcess | undefined;
   private disposed = false;
+  private retries = 0;
+  private retryTimer: NodeJS.Timeout | undefined;
+  /**
+   * Highest sequence number seen. Used as the replay cursor on reconnect so
+   * only the missed tail comes back rather than the whole session.
+   */
+  private lastSeq = -1;
 
   constructor(
     private readonly config: SessionConfig,
@@ -86,14 +96,19 @@ export class RoomSession {
     this.socket = socket;
 
     socket.on("open", () => {
+      const resuming = this.lastSeq >= 0;
+      this.retries = 0;
       this.send({
         type: "hello",
         roomId: this.config.roomId,
         userId: this.config.userId,
         name: this.config.name,
         role: "editor",
-        sinceSeq: -1,
+        // First connect replays everything; a reconnect asks only for what it
+        // missed while offline.
+        sinceSeq: this.lastSeq,
       });
+      if (resuming) this.handlers.onStatus("reconnected — catching up");
     });
 
     socket.on("message", (raw: Buffer) => {
@@ -106,10 +121,14 @@ export class RoomSession {
           );
           // Replay first so a late joiner reconstructs history before live
           // events land on top.
-          for (const event of msg.backlog) this.handlers.onEvent(event, true);
+          for (const event of msg.backlog) {
+            this.trackSeq(event.seq);
+            this.handlers.onEvent(event, true);
+          }
           this.handlers.onParticipants(msg.participants);
           break;
         case "event":
+          this.trackSeq(msg.event.seq);
           this.handlers.onEvent(msg.event, false);
           break;
         case "participants":
@@ -125,8 +144,34 @@ export class RoomSession {
       this.handlers.onStatus(`socket error: ${err.message}`),
     );
     socket.on("close", () => {
-      if (!this.disposed) this.handlers.onStatus("disconnected from relay");
+      if (this.disposed) return;
+      this.scheduleReconnect();
     });
+  }
+
+  private trackSeq(seq: number): void {
+    if (seq > this.lastSeq) this.lastSeq = seq;
+  }
+
+  /**
+   * Reconnect with backoff. A dropped socket used to leave the panel silently
+   * dead; because the relay is the ordering authority and the log is durable,
+   * recovery is just rejoining with the right cursor.
+   */
+  private scheduleReconnect(): void {
+    if (this.disposed || this.retryTimer) return;
+
+    const delay =
+      RETRY_DELAYS[Math.min(this.retries, RETRY_DELAYS.length - 1)]!;
+    this.retries++;
+    this.handlers.onStatus(
+      `disconnected — reconnecting in ${Math.round(delay / 1000)}s (attempt ${this.retries})`,
+    );
+
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = undefined;
+      if (!this.disposed) this.connect();
+    }, delay);
   }
 
   private send(msg: ClientMessage): void {
@@ -150,6 +195,10 @@ export class RoomSession {
    */
   dispose(): void {
     this.disposed = true;
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = undefined;
+    }
     this.socket?.close();
   }
 
