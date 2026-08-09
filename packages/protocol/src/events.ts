@@ -204,11 +204,16 @@ export const EventBody = z.discriminatedUnion("type", [
     reason: z.string().optional(),
   }),
 
-  // ---- reserved for M3+ ---------------------------------------------------
+  /**
+   * The agent changed a file on disk. Every participant needs to know, not
+   * just whoever happens to be hosting — an edit nobody can see is worse than
+   * no edit at all.
+   */
   z.object({
     type: z.literal("file.changed"),
     path: z.string(),
     turnId: z.string().nullable(),
+    tool: z.string(),
   }),
 ]);
 export type EventBody = z.infer<typeof EventBody>;

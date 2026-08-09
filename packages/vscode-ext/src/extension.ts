@@ -1,15 +1,21 @@
-import { existsSync } from "node:fs";
 import * as os from "node:os";
-import * as path from "node:path";
 import * as vscode from "vscode";
+import { revealChangedFile, watchDirtyBuffers } from "./buffers.js";
+import { ensureRelay, resolveServerPaths } from "./bootstrap.js";
 import { AgentPanel } from "./panel.js";
 import { RoomSession } from "./session.js";
 
 let session: RoomSession | undefined;
 let panel: AgentPanel | undefined;
+let bufferWatch: vscode.Disposable | undefined;
+let statusItem: vscode.StatusBarItem | undefined;
 
 function config() {
   return vscode.workspace.getConfiguration("mpa");
+}
+
+function setting(key: string): string | undefined {
+  return config().get<string>(key)?.trim() || undefined;
 }
 
 /**
@@ -25,8 +31,7 @@ function config() {
 async function resolveIdentity(
   context: vscode.ExtensionContext,
 ): Promise<{ userId: string; name: string } | undefined> {
-  const configured = config().get<string>("displayName")?.trim();
-  let name = configured;
+  let name = setting("displayName");
 
   if (!name) {
     name = (
@@ -35,7 +40,9 @@ async function resolveIdentity(
         value: os.userInfo().username,
         ignoreFocusOut: true,
         validateInput: (v) =>
-          v.trim().length === 0 ? "Pick something your teammates will recognise" : null,
+          v.trim().length === 0
+            ? "Pick something your teammates will recognise"
+            : null,
       })
     )?.trim();
     if (!name) return undefined;
@@ -58,43 +65,23 @@ async function resolveIdentity(
 }
 
 function slug(name: string): string {
-  return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "user";
+  return (
+    name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") ||
+    "user"
+  );
 }
 
-/**
- * Find the agent-host entry point.
- *
- * The dev layout (sibling package in the monorepo) is the only one that exists
- * when running from source, and the only one that does *not* exist once the
- * extension is installed from a .vsix into ~/.vscode/extensions — where the
- * old unconditional guess pointed at a file that was never there and failed
- * silently.
- */
-function resolveAgentHostEntry(
-  context: vscode.ExtensionContext,
-): { path: string } | { error: string } {
-  const configured = config().get<string>("agentHostEntry")?.trim();
-  if (configured) {
-    return existsSync(configured)
-      ? { path: configured }
-      : { error: `mpa.agentHostEntry points at a file that does not exist: ${configured}` };
+function showStatus(text: string, tooltip?: string): void {
+  if (!statusItem) {
+    statusItem = vscode.window.createStatusBarItem(
+      vscode.StatusBarAlignment.Left,
+      100,
+    );
+    statusItem.command = "mpa.showPanel";
   }
-
-  const candidates = [
-    // Installed layout, if the agent-host is ever shipped inside the extension.
-    path.join(context.extensionPath, "agent-host", "dist", "index.js"),
-    // Dev layout: packages/vscode-ext -> packages/agent-host/dist/index.js
-    path.join(context.extensionPath, "..", "agent-host", "dist", "index.js"),
-  ];
-  const found = candidates.find((c) => existsSync(c));
-  if (found) return { path: found };
-
-  return {
-    error:
-      "Could not find the agent-host. Set `mpa.agentHostEntry` to the absolute " +
-      "path of packages/agent-host/dist/index.js, or start it yourself with " +
-      "`pnpm agent` and use Join Session instead.",
-  };
+  statusItem.text = text;
+  statusItem.tooltip = tooltip ?? "Multiplayer Agent";
+  statusItem.show();
 }
 
 async function startSession(
@@ -113,30 +100,22 @@ async function startSession(
   const identity = await resolveIdentity(context);
   if (!identity) return;
 
-  // Fail before tearing down a working session: nothing is worse than losing
-  // the room you were in to a command that was never going to work.
-  let agentHostEntry = "";
-  if (host) {
-    const resolved = resolveAgentHostEntry(context);
-    if ("error" in resolved) {
-      const pick = await vscode.window.showErrorMessage(
-        resolved.error,
-        "Open Settings",
-        "Join Instead",
-      );
-      if (pick === "Open Settings") {
-        await vscode.commands.executeCommand(
-          "workbench.action.openSettings",
-          "mpa.agentHostEntry",
-        );
-      } else if (pick === "Join Instead") {
-        await startSession(context, false);
-      }
-      return;
+  const paths = resolveServerPaths(context.extensionPath, {
+    relay: setting("relayEntry"),
+    agentHost: setting("agentHostEntry"),
+  });
+  if ("error" in paths) {
+    const pick = await vscode.window.showErrorMessage(
+      paths.error,
+      "Open Settings",
+    );
+    if (pick === "Open Settings") {
+      await vscode.commands.executeCommand("workbench.action.openSettings", "mpa.");
     }
-    agentHostEntry = resolved.path;
+    return;
   }
 
+  const relayUrl = setting("relayUrl") ?? "ws://127.0.0.1:7331";
   const workspaceDir =
     vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? os.homedir();
   const cfg = config();
@@ -144,7 +123,11 @@ async function startSession(
   // One room at a time keeps things honest; multi-room comes with the sidebar.
   session?.dispose();
   panel?.dispose();
+  bufferWatch?.dispose();
 
+  // The panel comes up before the relay is contacted, so that starting one has
+  // somewhere to report to. Watching a blank screen wondering whether anything
+  // is happening is the failure this whole milestone keeps running into.
   panel = new AgentPanel(context.extensionUri, {
     submit: (text) => session?.submitPrompt(text),
     interrupt: () => session?.interrupt(),
@@ -155,21 +138,39 @@ async function startSession(
     dismissSuggestion: (id) => session?.dismissSuggestion(id),
     decideApproval: (requestId, allow) =>
       session?.decideApproval(requestId, allow),
+    openFile: (path) => void revealChangedFile(path),
   });
   panel.show(`Shared Agent — ${roomId}`);
 
+  const ready = await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: "Multiplayer Agent" },
+    async (progress) => {
+      progress.report({ message: "connecting to the relay…" });
+      return ensureRelay(paths.relayEntry, relayUrl, setting("dbPath"), (line) =>
+        panel?.postStatus(line),
+      );
+    },
+  );
+  if (!ready) {
+    panel.postStatus(`could not reach the relay at ${relayUrl}`);
+    void vscode.window.showErrorMessage(
+      `Could not reach or start the relay at ${relayUrl}. If it should be running elsewhere, check the mpa.relayUrl setting.`,
+    );
+    return;
+  }
+
   session = new RoomSession(
     {
-      relayUrl: cfg.get<string>("relayUrl") ?? "ws://127.0.0.1:7331",
+      relayUrl,
       roomId,
       userId: identity.userId,
       name: identity.name,
       host,
-      agentHostEntry,
+      agentHostEntry: paths.agentHostEntry,
       workspaceDir,
       allowedTools: cfg.get<string>("allowedTools") ?? "Read,Glob,Grep",
-      disallowedTools:
-        cfg.get<string>("disallowedTools") ?? "Write,Edit,MultiEdit,NotebookEdit",
+      disallowedTools: cfg.get<string>("disallowedTools") ?? "",
+      token: setting("token"),
       onFatal: (message) => {
         void vscode.window.showErrorMessage(message);
       },
@@ -183,9 +184,14 @@ async function startSession(
   );
   session.start();
 
-  vscode.window.setStatusBarMessage(
+  // The relay refuses agent writes to files anyone is still editing, which
+  // only works if it knows what those are.
+  bufferWatch = watchDirtyBuffers((paths) => session?.sendBufferState(paths));
+  context.subscriptions.push(bufferWatch);
+
+  showStatus(
+    `$(broadcast) ${roomId}`,
     `Multiplayer Agent: ${host ? "hosting" : "joined"} “${roomId}” as ${identity.name}`,
-    4000,
   );
 }
 
@@ -197,6 +203,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("mpa.joinSession", () =>
       startSession(context, false),
     ),
+    vscode.commands.registerCommand("mpa.showPanel", () =>
+      panel?.reveal() ??
+      vscode.window.showInformationMessage("No shared session is running."),
+    ),
     vscode.commands.registerCommand("mpa.interrupt", () => session?.interrupt()),
     vscode.commands.registerCommand("mpa.requestDriver", () =>
       session?.requestDriver(),
@@ -204,11 +214,13 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("mpa.releaseDriver", () =>
       session?.releaseDriver(),
     ),
-    vscode.commands.registerCommand("mpa.stopAgent", () => {
-      session?.stopAgent();
-      vscode.window.showInformationMessage(
-        "Shared agent stopped for everyone in the room.",
+    vscode.commands.registerCommand("mpa.stopAgent", async () => {
+      const pick = await vscode.window.showWarningMessage(
+        "Stop the shared agent? This ends the session for everyone in the room.",
+        { modal: true },
+        "Stop it",
       );
+      if (pick === "Stop it") session?.stopAgent();
     }),
     { dispose: () => deactivate() },
   );
@@ -219,4 +231,8 @@ export function deactivate(): void {
   session = undefined;
   panel?.dispose();
   panel = undefined;
+  bufferWatch?.dispose();
+  bufferWatch = undefined;
+  statusItem?.dispose();
+  statusItem = undefined;
 }

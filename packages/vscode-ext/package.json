@@ -31,6 +31,11 @@
         "category": "Multiplayer Agent"
       },
       {
+        "command": "mpa.showPanel",
+        "title": "Multiplayer Agent: Show Panel",
+        "category": "Multiplayer Agent"
+      },
+      {
         "command": "mpa.requestDriver",
         "title": "Multiplayer Agent: Ask to Drive",
         "category": "Multiplayer Agent"
@@ -64,6 +69,21 @@
           "default": "",
           "description": "Absolute path to agent-host dist/index.js. Leave empty to use the sibling package in this monorepo."
         },
+        "mpa.relayEntry": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to sync-server dist/index.js. The relay is started automatically when nothing is listening on mpa.relayUrl."
+        },
+        "mpa.token": {
+          "type": "string",
+          "default": "",
+          "description": "Token for a relay on another machine. Leave empty when the relay runs locally — its token is read automatically from ~/.multiplayer-agent/relay-token."
+        },
+        "mpa.dbPath": {
+          "type": "string",
+          "default": "",
+          "description": "Where an auto-started relay keeps its session log. Defaults to mpa-sessions.db beside the relay."
+        },
         "mpa.allowedTools": {
           "type": "string",
           "default": "Read,Glob,Grep",
@@ -71,8 +91,8 @@
         },
         "mpa.disallowedTools": {
           "type": "string",
-          "default": "Write,Edit,MultiEdit,NotebookEdit",
-          "description": "Tools nobody may approve. File writes stay here until M3 routes them through the shared document."
+          "default": "",
+          "description": "Tools nobody may approve, however much they want to. Empty by default: every tool outside mpa.allowedTools already needs a human decision, and the relay separately refuses writes to files someone is still editing."
         }
       }
     }

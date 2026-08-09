@@ -270,6 +270,64 @@ button.danger {
   gap: 8px;
 }
 
+/* The change itself is the decision, so it is shown as a diff rather than as
+   the JSON arguments of a tool call. */
+.approval .diff {
+  display: block;
+}
+
+.approval .filepath {
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.8em;
+  opacity: 0.6;
+  margin-bottom: 6px;
+  overflow-wrap: anywhere;
+}
+
+.diff .del,
+.args.add,
+.diff .add {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.diff .del {
+  color: var(--vscode-gitDecoration-deletedResourceForeground, #f14c4c);
+}
+
+.diff .add,
+.args.add {
+  color: var(--vscode-gitDecoration-addedResourceForeground, #3fb950);
+}
+
+.changed {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 12px;
+}
+
+button.link {
+  background: none;
+  padding: 2px 0;
+  color: var(--vscode-textLink-foreground);
+  text-decoration: underline;
+  font-size: 0.85em;
+}
+
+button.link:hover {
+  background: none;
+  color: var(--vscode-textLink-activeForeground);
+}
+
+#changed {
+  flex: 0 0 auto;
+  max-height: 20vh;
+  overflow-y: auto;
+  border-top: 1px solid var(--vscode-panel-border);
+}
+
 .queue-title {
   padding: 8px 12px 2px;
   font-size: 0.78em;

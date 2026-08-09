@@ -12,6 +12,10 @@
  *   MPA_DRIVE=1        ask for the driver token on join
  *   MPA_AUTOPROMOTE=1  run other people's suggestions as they arrive
  *   MPA_AUTOAPPROVE=1  approve suspended tool calls (MPA_AUTODENY=1 to refuse)
+ *   MPA_DIRTY=a.ts,b.ts
+ *                      pretend to be holding these files with unsaved changes,
+ *                      which is how the write-conflict guard gets exercised
+ *                      without opening an editor
  */
 import WebSocket from "ws";
 import {
@@ -22,6 +26,7 @@ import {
   type ClientMessage,
   type SessionEvent,
 } from "@mpa/protocol";
+import { readLocalToken } from "@mpa/protocol/token";
 
 const name = process.argv[2] ?? "tester";
 const prompt = process.argv[3];
@@ -33,6 +38,10 @@ const wantsDriver = flag("MPA_DRIVE");
 const autoPromote = flag("MPA_AUTOPROMOTE");
 const autoApprove = flag("MPA_AUTOAPPROVE");
 const autoDeny = flag("MPA_AUTODENY");
+const dirty = (process.env.MPA_DIRTY ?? "")
+  .split(",")
+  .map((p) => p.trim())
+  .filter(Boolean);
 
 let driving = false;
 
@@ -153,6 +162,7 @@ function render(event: SessionEvent, replay: boolean): void {
 }
 
 socket.on("open", () => {
+  const token = readLocalToken();
   send({
     type: "hello",
     roomId,
@@ -160,6 +170,7 @@ socket.on("open", () => {
     name,
     role: "editor",
     sinceSeq: -1,
+    ...(token ? { token } : {}),
   });
 });
 
@@ -172,6 +183,10 @@ socket.on("message", (raw) => {
       `[${name}] joined ${msg.roomId} — ${msg.backlog.length} events replayed, ${msg.participants.length} participants`,
     );
     for (const event of msg.backlog) render(event, true);
+    if (dirty.length > 0) {
+      console.log(`[${name}] holding unsaved: ${dirty.join(", ")}`);
+      send({ type: "bufferState", dirty });
+    }
     if (wantsDriver && !driving) send({ type: "requestDriver" });
     if (prompt) {
       // Whether this lands as a prompt or a suggestion is the relay's call.

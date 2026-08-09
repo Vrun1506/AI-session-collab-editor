@@ -8,7 +8,9 @@ log with real concurrency control**. Everything a client shows is derived state
 folded from that log, so someone joining ten minutes late sees exactly what
 everyone else sees.
 
-Status: **M2 complete** (see `Milestones` below).
+Status: **working MVP** — several people share one agent that can read, run
+commands and change code, with concurrency control and an auth gate. See
+`Milestones`.
 
 ## Architecture
 
@@ -36,6 +38,11 @@ lets it move into a cloud sandbox later without touching any client.
 | `packages/agent-host` | Agent SDK wrapper: prompt queue, event translation |
 | `packages/vscode-ext` | Extension + shared agent panel webview |
 
+Two seams are load-bearing for where this goes next. `EventStore` keeps SQLite
+swappable for Postgres when rooms outgrow one machine, and `Authenticator` keeps
+the shared token swappable for real accounts when the relay stops being
+something you run on your laptop.
+
 ## Prerequisites
 
 - Node 22+, pnpm 11+
@@ -48,17 +55,22 @@ lets it move into a cloud sandbox later without touching any client.
 ```bash
 pnpm install
 pnpm build
-
-# 1. relay
-pnpm relay
-
-# 2. VS Code Extension Development Host
-#    F5 in this repo, or:
-code --extensionDevelopmentPath=$PWD/packages/vscode-ext <some-project>
+pnpm package-ext && code --install-extension mpa-vscode.vsix
 ```
 
-In the dev host: **Multiplayer Agent: Host Session** (spawns the agent) in one
-window, **Multiplayer Agent: Join Session** with the same room name in another.
+Then, in any VS Code window: **Multiplayer Agent: Host Session**. You are asked
+for a room name and your display name; the relay and the agent both start on
+their own. A second window joins the same room with **Join Session**.
+
+There is no relay to start by hand and no token to copy — the extension starts
+one if nothing is listening, and reads its token from
+`~/.multiplayer-agent/relay-token`.
+
+The **agent-host does not ship inside the .vsix**, so the repo has to stay on
+disk: the Agent SDK depends on a ~270MB platform-specific native binary, which
+would make the extension enormous and wrong on every OS but one. The extension
+finds the built packages next to itself; if you move things, point
+`mpa.relayEntry` and `mpa.agentHostEntry` at the built `dist/index.js` files.
 
 ### Without VS Code
 
@@ -168,35 +180,107 @@ The SDK's cumulative session cost resets on resume, so it is not used. Room and
 per-participant totals are folded from per-turn deltas instead, and each turn's
 cost is charged to whoever's prompt started it.
 
+## Agent edits
+
+The agent can change code, and every write goes to the room first. The approval
+card shows the file and the change as a diff rather than a tool name and a blob
+of JSON, because the change *is* the decision and nobody consents meaningfully
+to `{"tool":"Edit",…}`.
+
+When a write lands, `file.changed` goes into the log and the panel lists what
+moved, for everyone — VS Code reloads an unmodified open file from disk by
+itself, but with no indication of which of your twelve open files it was.
+
+### The lost-update problem
+
+The agent writes to disk out of band from every editor buffer. So if someone has
+unsaved changes in `login.ts` and the agent rewrites it, their work is gone, with
+no undo and no warning.
+
+Approving harder does not fix this: the person clicking Approve is consenting to
+the change, and has no way of knowing a colleague is mid-edit. So editors report
+their dirty files and **the relay refuses the write before anyone is asked**:
+
+```
+⛔ system denied the tool call
+   bob has unsaved changes in that file. Ask them to save, or come back to it.
+```
+
+The agent is told who is holding it and says so rather than retrying. The
+refusal is computed before the request is broadcast and applied in the same
+tick, so it is not a race an eager approver can win.
+
+Not yet CRDT-backed shared buffers — the agent writes to disk and everyone
+reloads. That is honest for an MVP and enough to keep the failure mode above
+from ever happening; live co-editing is the next milestone.
+
+## Auth
+
+The relay listens on **loopback only** by default, and requires a token.
+
+Both matter more since the agent gained the ability to write files and run
+shell commands: `ws` binds every interface unless told otherwise, which had
+quietly put an unauthenticated socket — and through it a shell on the host's
+machine — on the local network.
+
+Locally there is nothing to configure. The relay mints a token on first run and
+writes it to `~/.multiplayer-agent/relay-token` with mode `0600`; clients on the
+same machine read it from there.
+
+To share a room across machines:
+
+```bash
+MPA_HOST=0.0.0.0 pnpm relay          # warns, loudly, that it is exposed
+```
+
+and give the other machine the token via the `mpa.token` setting. Read the
+safety note first — you are handing out the ability to run commands on the
+agent-host's machine.
+
+| Variable | Effect |
+| --- | --- |
+| `MPA_TOKEN` | Use this token instead of the generated one |
+| `MPA_TOKEN_FILE` | Where the token lives |
+| `MPA_HOST` | Interface to bind (default `127.0.0.1`) |
+| `MPA_NO_AUTH=1` | Disable the gate entirely — for tests, never for a shared machine |
+
+A shared secret proves you were told a secret, not that you are who you claim to
+be: everyone holding it can join as any name, so the audit log is only as
+trustworthy as the people with the token. That is acceptable for a team on one
+machine and **not** acceptable hosted, which is why the check sits behind an
+`Authenticator` interface in `packages/sync-server/src/auth.ts`. It returns the
+identity it verified rather than a boolean, so an OAuth implementation can
+overrule the name a client asks for. Replacing it should be a new class, not a
+change to the relay.
+
 ## Safety note
 
 In host-laptop mode a **guest's prompt runs tools on the host's machine with the
-host's credentials.** Three layers, in order:
+host's credentials.** Four layers, in order:
 
-1. `MPA_ALLOWED_TOOLS` (default `Read,Glob,Grep`) runs without asking. Reading
+1. The auth gate — you must hold the relay's token to be in the room at all.
+2. `MPA_ALLOWED_TOOLS` (default `Read,Glob,Grep`) runs without asking. Reading
    is cheap and reversible; waiting on a human for it would make the session
    unusable without making it safer.
-2. Everything else **asks the room** and blocks until the driver decides.
-3. `MPA_DISALLOWED_TOOLS` (default `Write,Edit,MultiEdit,NotebookEdit`) can be
-   approved by nobody. File writes stay here until M3 routes them through the
-   shared document — a write that silently clobbers someone's unsaved buffer is
-   not made safe by approving it.
-
-Layer 3 is also a backstop: a bug in layer 2 must not become arbitrary writes to
-the host's disk.
+3. Everything else **asks the room** and blocks until the driver decides. Writes
+   additionally cannot touch a file someone is still editing.
+4. `MPA_DISALLOWED_TOOLS` (empty by default) can be approved by nobody. Set it
+   if you want a harder guarantee than "a human said yes".
 
 Note that `allowedTools` is deliberately **not** passed to the SDK. A bare tool
 name there auto-approves it before any callback runs, which is exactly the
 shadowing the gate has to avoid — the SDK warns about this, and it is why layer
-1 is applied by our own hook.
+2 is applied by our own hook.
 
 ## Milestones
 
 - **M0 ✅** streaming shared session: everyone watches one agent live
 - **M1 ✅** durable log, session resume, reconnection
 - **M2 ✅** driver token, suggestion queue, shared approval gate
-- **M3** CRDT buffers, agent writes routed into the shared document
+- **MVP ✅** agent writes with lost-update protection, one-command start, auth
+- **M3** CRDT buffers, so people and the agent edit the same live document
 - **M4** checkpoint rewind, session fork, audit export
+- **Hosting** relay on a server, TLS, real accounts, org-level billing
 
 ## Tests and measurement
 

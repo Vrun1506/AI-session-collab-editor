@@ -7,6 +7,7 @@ import {
   type Participant,
   type SessionEvent,
 } from "@mpa/protocol";
+import { readLocalToken } from "@mpa/protocol/token";
 
 export interface SessionHandlers {
   onEvent(event: SessionEvent, replay: boolean): void;
@@ -28,6 +29,8 @@ export interface SessionConfig {
   workspaceDir: string;
   allowedTools: string;
   disallowedTools: string;
+  /** Undefined means "try the local relay's token file". */
+  token: string | undefined;
   /** Surfaced loudly, unlike `onStatus` — a shared agent that never started is
    *  not something to leave in a status line. */
   onFatal(message: string): void;
@@ -55,11 +58,23 @@ export class RoomSession {
    * only the missed tail comes back rather than the whole session.
    */
   private lastSeq = -1;
+  /**
+   * Our unsaved files, kept so they can be re-announced on reconnect. The relay
+   * drops them when a peer disconnects — it must, or a departed participant
+   * would block writes forever — so a silent reconnect would otherwise leave
+   * the protection quietly switched off.
+   */
+  private dirty: string[] = [];
+  private readonly token: string | undefined;
 
   constructor(
     private readonly config: SessionConfig,
     private readonly handlers: SessionHandlers,
-  ) {}
+  ) {
+    // Resolved once: a relay on this machine writes its token to a known file,
+    // so joining locally needs no configuration at all.
+    this.token = readLocalToken(config.token);
+  }
 
   start(): void {
     if (this.config.host) this.spawnAgentHost();
@@ -130,7 +145,11 @@ export class RoomSession {
         // First connect replays everything; a reconnect asks only for what it
         // missed while offline.
         sinceSeq: this.lastSeq,
+        ...(this.token ? { token: this.token } : {}),
       });
+      if (this.dirty.length > 0) {
+        this.send({ type: "bufferState", dirty: this.dirty });
+      }
       if (resuming) this.handlers.onStatus("reconnected — catching up");
     });
 
@@ -160,6 +179,15 @@ export class RoomSession {
           break;
         case "error":
           this.handlers.onStatus(`relay error: ${msg.message}`);
+          // Reconnecting with a credential the relay has already rejected only
+          // produces the same rejection, so stop and say so properly.
+          if (msg.message.startsWith("not authorised")) {
+            this.disposed = true;
+            this.config.onFatal(
+              `The relay rejected this connection: ${msg.message}. ` +
+                "If the relay is on another machine, put its token in the `mpa.token` setting.",
+            );
+          }
           break;
       }
     });
@@ -234,6 +262,13 @@ export class RoomSession {
 
   dismissSuggestion(suggestionId: string): void {
     this.send({ type: "dismissSuggestion", suggestionId });
+  }
+
+  /** Which files we are holding unsaved edits to, so the relay can refuse an
+   *  agent write that would destroy them. */
+  sendBufferState(dirty: string[]): void {
+    this.dirty = dirty;
+    this.send({ type: "bufferState", dirty });
   }
 
   decideApproval(requestId: string, allow: boolean, reason?: string): void {

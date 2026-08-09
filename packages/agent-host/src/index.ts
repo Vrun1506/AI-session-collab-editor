@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import WebSocket from "ws";
 import {
   query,
@@ -12,6 +13,7 @@ import {
   type ClientMessage,
   type EventBody,
 } from "@mpa/protocol";
+import { readLocalToken } from "@mpa/protocol/token";
 import { AsyncQueue } from "./queue.js";
 import { TurnTranslator } from "./translate.js";
 
@@ -26,6 +28,8 @@ import { TurnTranslator } from "./translate.js";
 const roomId = process.env.MPA_ROOM ?? "demo";
 const relayUrl = process.env.MPA_RELAY_URL ?? DEFAULT_RELAY_URL;
 const cwd = process.env.MPA_CWD ?? process.cwd();
+// MPA_TOKEN if given, otherwise whatever the relay on this machine minted.
+const relayToken = readLocalToken();
 
 const splitList = (v: string) =>
   v.split(",").map((t) => t.trim()).filter(Boolean);
@@ -43,22 +47,19 @@ const autoApproved = new Set(
 );
 
 /**
- * Tools nobody may authorise, however much they want to.
+ * Tools nobody may authorise, however much they want to. Empty by default now
+ * that every other tool goes to a human first.
  *
- * Until M2 there was nothing to ask, so the read-only guarantee had to come
- * entirely from this deny list. With the approval gate in place `Bash` and the
- * network tools move out of here and behind a human decision instead. The
- * file-writing tools stay denied until M3 routes agent writes through the
- * shared document — a write that silently clobbers someone's unsaved buffer is
- * not made safe by approving it.
+ * File writes used to live here, because approving a write is not the same as
+ * consenting to destroy a colleague's unsaved buffer and the approver has no
+ * way to tell the difference. That gap is closed in the relay instead: it
+ * refuses a write to a file anyone is still editing before the room is even
+ * asked. So the agent can finally change code, which is the point of it.
  *
- * It also stays as a backstop: a bug in the gate must not become arbitrary
- * writes to the host's disk.
+ * The list remains as an escape hatch for anyone who wants a harder guarantee
+ * than "a human said yes" — set `MPA_DISALLOWED_TOOLS` to pin tools off.
  */
-const disallowedTools = splitList(
-  process.env.MPA_DISALLOWED_TOOLS ??
-    "Write,Edit,MultiEdit,NotebookEdit",
-);
+const disallowedTools = splitList(process.env.MPA_DISALLOWED_TOOLS ?? "");
 
 /**
  * How long a suspended tool call waits for a human before it gives up.
@@ -133,6 +134,10 @@ function connect(): void {
         role: "agent-host",
         // The host does not replay history; the editors are the readers.
         sinceSeq: Number.MAX_SAFE_INTEGER,
+        // Lets the relay resolve the paths a tool call asks to write against
+        // the same root the agent is working in.
+        cwd,
+        ...(relayToken ? { token: relayToken } : {}),
       }),
     );
     if (!started) publish({ type: "agent.status", state: "starting" });
@@ -198,6 +203,17 @@ function connect(): void {
       }
       case "error": {
         console.error("[agent-host] relay error:", msg.message);
+        // Retrying a rejected credential just produces the same rejection
+        // every few seconds forever. Stop, and say what to do about it.
+        if (msg.message.startsWith("not authorised")) {
+          console.error(
+            "[agent-host] set MPA_TOKEN to the relay's token " +
+              "(see the relay's startup log for where it lives), then start again.",
+          );
+          shuttingDown = true;
+          prompts.close();
+          process.exit(1);
+        }
         break;
       }
     }
@@ -308,6 +324,34 @@ async function askTheRoom(
   });
 }
 
+/** Tools whose effect is a file on disk changing. */
+const WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+
+/**
+ * Tell the room which files actually changed.
+ *
+ * Approving a write is not the same as seeing it land: without this the file
+ * changes on the host's disk and everyone else's editor shows the old content
+ * with no hint that anything happened.
+ */
+const reportFileChange: HookCallback = async (input) => {
+  if (input.hook_event_name !== "PostToolUse") return {};
+  if (!WRITE_TOOLS.has(input.tool_name)) return {};
+
+  const toolInput = input.tool_input as Record<string, unknown> | undefined;
+  const raw =
+    toolInput?.["file_path"] ?? toolInput?.["notebook_path"] ?? toolInput?.["path"];
+  if (typeof raw !== "string" || !raw) return {};
+
+  publish({
+    type: "file.changed",
+    path: resolve(cwd, raw),
+    turnId: translator.openTurnId,
+    tool: input.tool_name,
+  });
+  return {};
+};
+
 const gateToolCall: HookCallback = async (input, _toolUseId, options) => {
   if (input.hook_event_name !== "PreToolUse") return {};
   const toolName = input.tool_name;
@@ -346,9 +390,15 @@ The workspace root is ${cwd}. All file paths you use must be relative to that \
 root or absolute beneath it; a leading "/" means the filesystem root, not the \
 project. Prefer Glob or Grep over guessing a path.
 
-Some of your tools pause for a human decision before they run. If a tool call \
-is declined, do not retry it — explain what you wanted to do and why, and let \
-the room respond.`;
+Most of your tools pause for a human decision before they run, and the room \
+sees the arguments you asked for. Prefer one clear, complete change over a \
+series of small ones, since each is a separate interruption for a person who \
+has to read it.
+
+If a tool call is declined, do not retry it. If the refusal says someone has \
+unsaved changes in the file, say so plainly and offer to continue once they \
+save — do not attempt to write it another way. Otherwise explain what you \
+wanted to do and why, and let the room respond.`;
 
 async function runAgentLoop(resumeSessionId: string | null): Promise<void> {
   try {
@@ -366,6 +416,7 @@ async function runAgentLoop(resumeSessionId: string | null): Promise<void> {
               hooks: [gateToolCall],
             },
           ],
+          PostToolUse: [{ hooks: [reportFileChange] }],
         },
         systemPrompt: {
           type: "preset",

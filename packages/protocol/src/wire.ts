@@ -36,6 +36,16 @@ export const ClientMessage = z.discriminatedUnion("type", [
     role: PeerRole,
     /** Replay cursor: send everything strictly after this seq. -1 = full history. */
     sinceSeq: z.number().int().default(-1),
+    /** agent-host only: the workspace root it is running against, so the relay
+     *  can resolve the relative paths a tool call asks to write. */
+    cwd: z.string().optional(),
+    /**
+     * Proof that this peer is allowed in. Optional on the wire so the relay
+     * can answer a missing token with a useful message rather than a parse
+     * failure — whether one is *required* is the relay's decision, not the
+     * schema's.
+     */
+    token: z.string().optional(),
   }),
   /** Append to the shared log. The relay stamps seq/ts and fans out. */
   z.object({
@@ -88,6 +98,21 @@ export const ClientMessage = z.discriminatedUnion("type", [
     requestId: z.string(),
     allow: z.boolean(),
     reason: z.string().optional(),
+  }),
+
+  /**
+   * Editor -> relay: absolute paths this participant is holding unsaved edits
+   * to.
+   *
+   * The agent writes to disk out of band from every editor buffer, so without
+   * this a write silently destroys someone's unsaved work — the failure mode
+   * most likely to lose a user permanently. Sent as the whole set rather than
+   * deltas so a reconnect resynchronises by itself, and kept out of the event
+   * log because it is presence, not history.
+   */
+  z.object({
+    type: z.literal("bufferState"),
+    dirty: z.array(z.string()),
   }),
 
   z.object({ type: z.literal("ping") }),

@@ -20,6 +20,7 @@
   const approvalsEl = document.getElementById("approvals");
   const queueEl = document.getElementById("queue");
   const ledgerEl = document.getElementById("ledger");
+  const changedFilesEl = document.getElementById("changed");
   const sendEl = document.getElementById("send");
   const inputEl = /** @type {HTMLTextAreaElement} */ (
     document.getElementById("input")
@@ -45,6 +46,14 @@
   const suggestions = new Map();
   /** requestId -> {toolName, input} for calls still suspended */
   const approvals = new Map();
+  /** path -> times changed, so the room can see what the agent actually did */
+  const changedFiles = new Map();
+  /**
+   * Prompts accepted while the agent is mid-turn. The SDK queues them, but
+   * silently — without this a second prompt reads as having been swallowed.
+   */
+  const queuedPrompts = [];
+  let agentBusy = false;
 
   /** promptId -> author, and turnId -> promptId, so a turn's cost has an owner. */
   const promptAuthors = new Map();
@@ -68,6 +77,7 @@
       renderDriverBar();
       renderApprovals();
       renderQueue();
+      renderChangedFiles();
       renderLedger();
       renderComposer();
     });
@@ -129,14 +139,80 @@
     }
   }
 
+  const WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+
+  /**
+   * Describe what is actually about to happen.
+   *
+   * "Agent wants to run Edit" plus a blob of JSON is not something a person can
+   * consent to in the two seconds they will spend on it. For a write, the file
+   * and the change are the whole decision, so they get shown as a diff.
+   */
+  function describeApproval(card, toolName, input) {
+    const args = input && typeof input === "object" ? input : {};
+    const file = args.file_path ?? args.notebook_path ?? args.path;
+
+    if (WRITE_TOOLS.has(toolName) && typeof file === "string") {
+      card.append(text("div", "who", `⏸ Agent wants to edit ${basename(file)}`));
+      card.append(text("div", "filepath", file));
+
+      const edits = Array.isArray(args.edits)
+        ? args.edits
+        : args.old_string !== undefined
+          ? [{ old_string: args.old_string, new_string: args.new_string }]
+          : [];
+
+      if (edits.length > 0) {
+        const diff = document.createElement("pre");
+        diff.className = "args diff";
+        for (const edit of edits) {
+          diff.append(text("span", "del", prefixLines(edit.old_string, "-")));
+          diff.append(text("span", "add", prefixLines(edit.new_string, "+")));
+        }
+        card.append(diff);
+      } else if (typeof args.content === "string") {
+        card.append(
+          text("pre", "args add", prefixLines(args.content, "+")),
+        );
+      } else {
+        card.append(text("pre", "args", stringify(input)));
+      }
+      return;
+    }
+
+    if (toolName === "Bash" && typeof args.command === "string") {
+      card.append(text("div", "who", "⏸ Agent wants to run a command"));
+      card.append(text("pre", "args", args.command));
+      if (typeof args.description === "string") {
+        card.append(text("div", "muted", args.description));
+      }
+      return;
+    }
+
+    card.append(text("div", "who", `⏸ Agent wants to run ${toolName}`));
+    card.append(text("pre", "args", stringify(input)));
+  }
+
+  function prefixLines(value, marker) {
+    if (typeof value !== "string" || value === "") return "";
+    return `${value
+      .split("\n")
+      .map((line) => `${marker} ${line}`)
+      .join("\n")}\n`;
+  }
+
+  function basename(p) {
+    const parts = String(p).split(/[\\/]/);
+    return parts[parts.length - 1] || p;
+  }
+
   function renderApprovals() {
     approvalsEl.replaceChildren();
     for (const [requestId, a] of approvals) {
       const card = document.createElement("div");
       card.className = "approval";
 
-      card.append(text("div", "who", `⏸ Agent wants to run ${a.toolName}`));
-      card.append(text("pre", "args", stringify(a.input)));
+      describeApproval(card, a.toolName, a.input);
 
       const row = document.createElement("div");
       row.className = "row";
@@ -195,6 +271,33 @@
     }
   }
 
+  /**
+   * What the agent changed, for everyone rather than only the host.
+   *
+   * VS Code reloads an unmodified open file from disk by itself, so a
+   * participant with the file open already sees the new content — but with no
+   * indication that it moved, or which of the twelve open files it was.
+   */
+  function renderChangedFiles() {
+    changedFilesEl.replaceChildren();
+    if (changedFiles.size === 0) return;
+
+    changedFilesEl.append(
+      text("div", "queue-title", `${changedFiles.size} file(s) changed by the agent`),
+    );
+    for (const [path, count] of changedFiles) {
+      const row = document.createElement("div");
+      row.className = "changed";
+      const open = button(basename(path), "link", () =>
+        vscode.postMessage({ type: "openFile", path }),
+      );
+      open.title = path;
+      row.append(open);
+      if (count > 1) row.append(text("span", "muted", `×${count}`));
+      changedFilesEl.append(row);
+    }
+  }
+
   function renderLedger() {
     if (totalCostUsd === 0) {
       ledgerEl.textContent = "";
@@ -215,6 +318,10 @@
     inputEl.placeholder = driving
       ? "Prompt the shared agent… (Enter to send, Shift+Enter for newline)"
       : `Suggest a prompt for ${driver ? driver.name : "the driver"} to run…`;
+
+    if (queuedPrompts.length > 0) {
+      statusEl.textContent = `${queuedPrompts.length} prompt(s) waiting for the agent to finish`;
+    }
   }
 
   function text(tag, className, content) {
@@ -352,6 +459,9 @@
           ? `${who} · run by ${b.promotedBy.name}`
           : who;
         transcriptEl.appendChild(addBlock("prompt", header, b.text));
+        // Accepted, but the agent is still on the previous one. Saying so is
+        // the difference between "queued" and "did that even send?".
+        if (agentBusy) queuedPrompts.push(b.promptId);
         break;
       }
 
@@ -400,7 +510,12 @@
 
       case "turn.started": {
         dotEl.className = "dot busy";
-        if (b.promptId) turnPrompts.set(b.turnId, b.promptId);
+        agentBusy = true;
+        if (b.promptId) {
+          turnPrompts.set(b.turnId, b.promptId);
+          const at = queuedPrompts.indexOf(b.promptId);
+          if (at >= 0) queuedPrompts.splice(at, 1);
+        }
         // Replayed history already contains the outcome; a placeholder would
         // just be a stale spinner in the middle of the transcript.
         if (!replay) showPending();
@@ -409,6 +524,7 @@
 
       case "turn.completed": {
         clearPending();
+        agentBusy = false;
         const cost = b.usage.costUsd ?? 0;
         creditCost(b.turnId, cost);
         meta(
@@ -420,8 +536,15 @@
 
       case "turn.interrupted": {
         clearPending();
+        agentBusy = false;
         meta("turn interrupted");
         dotEl.className = "dot";
+        break;
+      }
+
+      case "file.changed": {
+        changedFiles.set(b.path, (changedFiles.get(b.path) ?? 0) + 1);
+        meta(`✎ ${b.tool} changed ${basename(b.path)}`);
         break;
       }
 

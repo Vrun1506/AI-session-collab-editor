@@ -11,6 +11,7 @@ export interface PanelActions {
   promoteSuggestion(suggestionId: string): void;
   dismissSuggestion(suggestionId: string): void;
   decideApproval(requestId: string, allow: boolean): void;
+  openFile(path: string): void;
 }
 
 interface WebviewMessage {
@@ -20,6 +21,7 @@ interface WebviewMessage {
   suggestionId?: string;
   requestId?: string;
   allow?: boolean;
+  path?: string;
 }
 
 /**
@@ -84,11 +86,18 @@ export class AgentPanel {
             this.actions.decideApproval(msg.requestId, msg.allow === true);
           }
           break;
+        case "openFile":
+          if (msg.path) this.actions.openFile(msg.path);
+          break;
       }
     });
     this.panel.onDidDispose(() => {
       this.panel = undefined;
     });
+  }
+
+  reveal(): void {
+    this.panel?.reveal(vscode.ViewColumn.Beside);
   }
 
   postEvent(event: SessionEvent, replay: boolean): void {
@@ -140,6 +149,7 @@ export class AgentPanel {
   <div id="approvals"></div>
   <div id="queue"></div>
   <main id="transcript"></main>
+  <div id="changed"></div>
   <footer>
     <textarea id="input" rows="2"></textarea>
     <button id="send">Send</button>

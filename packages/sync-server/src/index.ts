@@ -15,8 +15,10 @@ import {
   type DriverAction,
   type GrantReason,
 } from "./policy.js";
+import { authenticatorFromEnv, tokenFilePath } from "./auth.js";
 import { Room } from "./room.js";
 import { MemoryEventStore, SqliteEventStore, type EventStore } from "./store.js";
+import { DirtyBufferIndex, isWriteTool, targetPath } from "./writes.js";
 
 interface Peer {
   socket: WebSocket;
@@ -38,6 +40,10 @@ const driverIdleMs = Number(process.env.MPA_DRIVER_IDLE_MS ?? 120_000);
 
 const rooms = new Map<string, Room>();
 const peers = new Map<WebSocket, Peer>();
+const dirtyBuffers = new DirtyBufferIndex();
+const authenticator = authenticatorFromEnv();
+/** Workspace root per room, reported by the agent-host on hello. */
+const roomCwd = new Map<string, string>();
 
 function getRoom(roomId: string): Room {
   let room = rooms.get(roomId);
@@ -111,6 +117,64 @@ function grantDriver(
   console.log(`[relay] ${roomId}: ${to.name} is driving (${reason})`);
 }
 
+// ---------------------------------------------------------------------------
+// Approvals
+// ---------------------------------------------------------------------------
+
+/**
+ * Record a decision and release the suspended tool call.
+ *
+ * Shared by the driver's click and by the relay's own refusals, so both end up
+ * in the transcript the same way. A decision the room cannot see afterwards is
+ * not much of a shared approval gate.
+ */
+function decideApproval(
+  roomId: string,
+  actor: EventDraft["actor"],
+  requestId: string,
+  allow: boolean,
+  reason: string | undefined,
+): void {
+  publish(roomId, {
+    actor,
+    body: {
+      type: "tool.approval.decided",
+      requestId,
+      allow,
+      ...(reason ? { reason } : {}),
+    },
+  });
+  const host = agentHostIn(roomId);
+  if (host) {
+    send(host.socket, {
+      type: "toolDecision",
+      requestId,
+      allow,
+      ...(reason ? { reason } : {}),
+    });
+  }
+}
+
+/** Display names of anyone whose unsaved work this tool call would destroy. */
+function whoWouldLoseWork(
+  roomId: string,
+  toolName: string,
+  input: unknown,
+): string[] {
+  if (!isWriteTool(toolName)) return [];
+  const path = targetPath(toolName, input, roomCwd.get(roomId) ?? process.cwd());
+  if (!path) return [];
+
+  const room = getRoom(roomId);
+  return dirtyBuffers
+    .holders(roomId, path)
+    .map(
+      (userId) =>
+        room.listParticipants().find((p) => p.userId === userId)?.name ??
+        userId,
+    );
+}
+
 /** Carry out whatever `policy.ts` decided. */
 function applyDriverAction(roomId: string, action: DriverAction): void {
   switch (action.kind) {
@@ -139,7 +203,20 @@ function applyDriverAction(roomId: string, action: DriverAction): void {
 // ---------------------------------------------------------------------------
 
 const port = Number(process.env.MPA_RELAY_PORT ?? DEFAULT_RELAY_PORT);
-const wss = new WebSocketServer({ port });
+
+/**
+ * Loopback unless someone deliberately opens it up.
+ *
+ * `ws` binds every interface by default, which put an unauthenticated socket on
+ * the local network — and through it, an agent that can write files and run
+ * shell commands on this machine. That was survivable while the agent was
+ * read-only. It is not now.
+ *
+ * Set `MPA_HOST=0.0.0.0` to share a room across machines, and read the auth
+ * section of the README before doing so.
+ */
+const host = process.env.MPA_HOST ?? "127.0.0.1";
+const wss = new WebSocketServer({ port, host });
 
 wss.on("connection", (socket) => {
   socket.on("message", (raw) => {
@@ -158,6 +235,27 @@ wss.on("connection", (socket) => {
 
     switch (msg.type) {
       case "hello": {
+        // Checked before anything else touches room state, so an unauthorised
+        // socket cannot create a room, publish, or appear in presence.
+        const auth = authenticator.authenticate({
+          token: msg.token,
+          userId: msg.userId,
+          name: msg.name,
+          roomId: msg.roomId,
+        });
+        if (!auth.ok) {
+          console.warn(
+            `[relay] rejected ${msg.name} for ${msg.roomId}: ${auth.reason}`,
+          );
+          refuse(socket, `not authorised — ${auth.reason}`);
+          socket.close();
+          return;
+        }
+        // The verified identity wins over whatever was asked for; today they
+        // are the same, but that is what makes real accounts a drop-in later.
+        msg.userId = auth.userId;
+        msg.name = auth.name;
+
         const room = getRoom(msg.roomId);
         if (msg.role === "agent-host" && room.hasAgentHost()) {
           refuse(socket, "room already has an agent-host");
@@ -174,6 +272,8 @@ wss.on("connection", (socket) => {
             existing.socket.close();
           }
         }
+
+        if (msg.role === "agent-host" && msg.cwd) roomCwd.set(msg.roomId, msg.cwd);
 
         const participant: Participant = {
           userId: msg.userId,
@@ -391,6 +491,15 @@ wss.on("connection", (socket) => {
         }
         if (existing) return;
 
+        // Decided before the request goes out, and applied in the same tick,
+        // so no participant's approval can be processed in between. A human
+        // clicking Approve is consenting to the change, not to destroying a
+        // colleague's unsaved work — and they have no way of knowing about it,
+        // so this must not be a race they can win.
+        const blocked = whoWouldLoseWork(roomId, msg.toolName, msg.input);
+
+        // Published even when refused: the room should see what the agent
+        // tried to do, not just that something was blocked.
         publish(roomId, {
           actor: { kind: "agent" },
           body: {
@@ -401,6 +510,17 @@ wss.on("connection", (socket) => {
             turnId: msg.turnId,
           },
         });
+
+        if (blocked.length > 0) {
+          const names = blocked.join(" and ");
+          decideApproval(
+            roomId,
+            { kind: "system" },
+            msg.requestId,
+            false,
+            `${names} ${blocked.length === 1 ? "has" : "have"} unsaved changes in that file. Ask them to save, or come back to it.`,
+          );
+        }
         return;
       }
 
@@ -416,26 +536,18 @@ wss.on("connection", (socket) => {
         if (!approval || approval.decision) return;
 
         room.markDriverActive();
-        // Log before releasing the agent: the decision is part of the shared
-        // history whether or not the tool call then succeeds.
-        publish(roomId, {
-          actor: { kind: "user", userId: me.userId, name: me.name },
-          body: {
-            type: "tool.approval.decided",
-            requestId: msg.requestId,
-            allow: msg.allow,
-            ...(msg.reason ? { reason: msg.reason } : {}),
-          },
-        });
-        const host = agentHostIn(roomId);
-        if (host) {
-          send(host.socket, {
-            type: "toolDecision",
-            requestId: msg.requestId,
-            allow: msg.allow,
-            ...(msg.reason ? { reason: msg.reason } : {}),
-          });
-        }
+        decideApproval(
+          roomId,
+          { kind: "user", userId: me.userId, name: me.name },
+          msg.requestId,
+          msg.allow,
+          msg.reason,
+        );
+        return;
+      }
+
+      case "bufferState": {
+        dirtyBuffers.set(peer!.roomId, peer!.participant.userId, msg.dirty);
         return;
       }
 
@@ -465,6 +577,9 @@ wss.on("connection", (socket) => {
     const room = getRoom(peer.roomId);
     room.removeParticipant(peer.participant.userId);
     room.dropRequest(peer.participant.userId);
+    // Their unsaved buffers left with them; holding the lock open would block
+    // writes on behalf of somebody who is no longer here.
+    dirtyBuffers.clear(peer.roomId, peer.participant.userId);
 
     if (peer.participant.role === "editor") {
       publish(peer.roomId, {
@@ -544,5 +659,13 @@ function dispatchPrompt(
 }
 
 wss.on("listening", () => {
-  console.log(`[relay] listening on ws://127.0.0.1:${port}`);
+  console.log(`[relay] listening on ws://${host}:${port}`);
+  console.log(`[relay] auth: ${authenticator.describe()} — ${tokenFilePath()}`);
+  if (host !== "127.0.0.1" && host !== "localhost") {
+    console.warn(
+      `[relay] WARNING: reachable from the network on ${host}:${port}. ` +
+        "Anyone who can connect can drive an agent that writes files and runs " +
+        "commands on the agent-host's machine.",
+    );
+  }
 });
