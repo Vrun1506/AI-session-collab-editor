@@ -1,0 +1,9 @@
+packages:
+  - "packages/*"
+allowBuilds:
+  # esbuild's postinstall fetches its platform-native binary; required to build
+  # the VS Code extension bundle.
+  esbuild: true
+  # Only needed to publish to the Marketplace, not to package a local .vsix.
+  '@vscode/vsce-sign': false
+  keytar: false

@@ -1,0 +1,81 @@
+{
+  "name": "mpa-vscode",
+  "displayName": "Multiplayer Agent",
+  "description": "Share one live agent session with your team — powered by Claude",
+  "version": "0.0.1",
+  "publisher": "mpa-dev",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "mpa.hostSession",
+        "title": "Multiplayer Agent: Host Session",
+        "category": "Multiplayer Agent"
+      },
+      {
+        "command": "mpa.joinSession",
+        "title": "Multiplayer Agent: Join Session",
+        "category": "Multiplayer Agent"
+      },
+      {
+        "command": "mpa.interrupt",
+        "title": "Multiplayer Agent: Interrupt Turn",
+        "category": "Multiplayer Agent"
+      },
+      {
+        "command": "mpa.stopAgent",
+        "title": "Multiplayer Agent: Stop Shared Agent (ends it for everyone)",
+        "category": "Multiplayer Agent"
+      }
+    ],
+    "configuration": {
+      "title": "Multiplayer Agent",
+      "properties": {
+        "mpa.relayUrl": {
+          "type": "string",
+          "default": "ws://127.0.0.1:7331",
+          "description": "WebSocket URL of the sync-server relay."
+        },
+        "mpa.displayName": {
+          "type": "string",
+          "default": "",
+          "description": "Name shown to other participants. Defaults to your OS username."
+        },
+        "mpa.agentHostEntry": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to agent-host dist/index.js. Defaults to the sibling package in this monorepo."
+        },
+        "mpa.allowedTools": {
+          "type": "string",
+          "default": "Read,Glob,Grep",
+          "description": "Comma-separated tools the shared agent may use. M0 is read-only by design."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@mpa/protocol": "workspace:*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/vscode": "^1.90.0",
+    "@types/ws": "^8.5.13",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.24.2"
+  }
+}

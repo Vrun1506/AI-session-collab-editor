@@ -1,0 +1,22 @@
+{
+  "name": "@mpa/sync-server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/index.js",
+    "client": "node dist/test-client.js",
+    "test": "node --test dist/*.test.js"
+  },
+  "dependencies": {
+    "@mpa/protocol": "workspace:*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13"
+  }
+}

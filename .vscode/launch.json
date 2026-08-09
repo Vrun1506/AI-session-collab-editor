@@ -1,0 +1,15 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Multiplayer Agent extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/packages/vscode-ext",
+        "${workspaceFolder}/fixtures/demo-repo"
+      ],
+      "outFiles": ["${workspaceFolder}/packages/vscode-ext/out/**/*.js"]
+    }
+  ]
+}
