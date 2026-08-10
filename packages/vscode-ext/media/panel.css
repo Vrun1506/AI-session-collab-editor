@@ -234,6 +234,28 @@ button.danger {
   opacity: 0.65;
 }
 
+/* Part of an agent change that could not be applied. Rare, and the one merge
+   outcome where the file does not say what the transcript implies it says —
+   so it is styled as a warning rather than another grey status line. */
+.conflict {
+  align-self: stretch;
+  margin: 4px 12px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--vscode-inputValidation-warningBackground);
+  border-left: 3px solid var(--vscode-charts-yellow, #d29922);
+}
+
+.conflict .who {
+  font-weight: 600;
+  font-size: 0.85em;
+  margin-bottom: 2px;
+}
+
+.conflict .body {
+  font-size: 0.9em;
+}
+
 /* A suspended tool call is the one thing on screen that is actually blocking
    the agent, so it sits above the transcript rather than scrolling away in it. */
 .approval {

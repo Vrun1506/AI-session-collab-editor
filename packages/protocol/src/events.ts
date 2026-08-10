@@ -215,6 +215,28 @@ export const EventBody = z.discriminatedUnion("type", [
     turnId: z.string().nullable(),
     tool: z.string(),
   }),
+
+  // ---- shared buffers (M3) -------------------------------------------------
+  /**
+   * An agent write was merged into a document people had open, rather than
+   * landing on disk for everyone to reload.
+   *
+   * The counts are the honest part. The agent computed its change against the
+   * file as it was when the tool started; anything typed since then moves the
+   * change (`moved`) or, if someone rewrote the very lines the agent meant to
+   * change, leaves it unapplied (`conflicts`). A room that cannot see that
+   * happened would be trusting a merge it has no way to check.
+   */
+  z.object({
+    type: z.literal("doc.merged"),
+    path: z.string(),
+    turnId: z.string().nullable(),
+    applied: z.number().int(),
+    moved: z.number().int(),
+    conflicts: z.number().int(),
+    /** Who had the file open, so the transcript says whose buffer changed. */
+    holders: z.array(z.string()),
+  }),
 ]);
 export type EventBody = z.infer<typeof EventBody>;
 

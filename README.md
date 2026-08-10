@@ -9,8 +9,8 @@ folded from that log, so someone joining ten minutes late sees exactly what
 everyone else sees.
 
 Status: **working MVP** — several people share one agent that can read, run
-commands and change code, with concurrency control and an auth gate. See
-`Milestones`.
+commands and change code, with concurrency control, live shared buffers and an
+auth gate. See `Milestones`.
 
 ## Architecture
 
@@ -34,7 +34,8 @@ lets it move into a cloud sandbox later without touching any client.
 | Package | Role |
 | --- | --- |
 | `packages/protocol` | zod schemas for the event log and wire protocol — the contract |
-| `packages/sync-server` | WebSocket relay, event log, replay |
+| `packages/crdt` | shared text: hunk diffing, and merging an agent write into a document people are typing in |
+| `packages/sync-server` | WebSocket relay, event log, replay, live documents |
 | `packages/agent-host` | Agent SDK wrapper: prompt queue, event translation |
 | `packages/vscode-ext` | Extension + shared agent panel webview |
 
@@ -95,6 +96,24 @@ live token stream, the tool call suspended for approval, Alice's decision, and
 the cost. Swap `MPA_AUTOAPPROVE=1` for `MPA_AUTODENY=1` to watch the agent get
 refused. `MPA_DRIVE=1` asks for the token on join.
 
+The client is a real editor peer, not a viewer, which is how the shared-buffer
+races are reproduced without timing two people's typing by hand:
+
+```bash
+# Alice holds login.ts open, with unsaved work, and types the instant the
+# agent starts writing it.
+MPA_ROOM=demo MPA_AUTOPROMOTE=1 MPA_AUTOAPPROVE=1 \
+  MPA_OPEN=src/login.ts \
+  MPA_UNSAVED='// not saved yet
+' MPA_TYPE_ON_LOCK='// typed during the write
+' node packages/sync-server/dist/test-client.js alice
+```
+
+Interrupt it and it prints the document it ended up with, which is what to
+compare against the file on disk. `MPA_REPLACE_ON_LOCK='old>>new'` rewrites text
+instead of appending it — aim it at the lines the agent is about to change and
+the merge should report a conflict rather than overwrite you.
+
 ## Concurrency control
 
 Exactly one participant holds the **driver token** and may prompt the agent
@@ -117,7 +136,8 @@ two cases where waiting for them would deadlock the room:
 | Driver has gone quiet | Taken after `MPA_DRIVER_IDLE_MS` (default 120s) |
 
 `interrupt()` is available to **everyone** regardless of the token: a deadlocked
-room is worse than a cancelled turn.
+room is worse than a cancelled turn. So is typing — the token governs who talks
+to the agent, not who may edit code.
 
 The rules live in `packages/sync-server/src/policy.ts`, apart from the socket
 handling, because they are the actual product decision here.
@@ -188,31 +208,92 @@ of JSON, because the change *is* the decision and nobody consents meaningfully
 to `{"tool":"Edit",…}`.
 
 When a write lands, `file.changed` goes into the log and the panel lists what
-moved, for everyone — VS Code reloads an unmodified open file from disk by
-itself, but with no indication of which of your twelve open files it was.
+moved, for everyone — otherwise the file quietly differs and nobody knows which
+of your twelve open tabs it was.
 
-### The lost-update problem
+## Shared buffers
 
-The agent writes to disk out of band from every editor buffer. So if someone has
-unsaved changes in `login.ts` and the agent rewrites it, their work is gone, with
-no undo and no warning.
+A file anybody has open is a **live CRDT document**, held by the relay while at
+least one editor is attached to it. Two people can type in it at once, and the
+agent writes into the same text rather than over it.
 
-Approving harder does not fix this: the person clicking Approve is consenting to
-the change, and has no way of knowing a colleague is mid-edit. So editors report
-their dirty files and **the relay refuses the write before anyone is asked**:
+Two problems disappear at once, and they are the two that make an agent in a
+shared workspace feel dangerous.
+
+**The agent read a file that was already out of date.** Before any file-touching
+tool runs, the relay asks whoever holds unsaved changes to save, and waits.
+`Bash` and `Grep` flush *every* live document, because a test run that sees the
+last-saved version of a file someone has been editing for ten minutes produces a
+result about a project that does not exist. The editors do the saving rather
+than the agent writing their files for them: VS Code's own save is silent, where
+a file changing underneath a dirty buffer means a conflict prompt.
+
+**The agent overwrote what somebody was typing.** The agent tells the relay what
+the file said before and after, not just after, so the change arrives as hunks.
+Each hunk is placed by matching the text around it rather than trusting an
+offset, so an edit at line 200 still lands when someone added a line at the top:
 
 ```
-⛔ system denied the tool call
-   bob has unsaved changes in that file. Ask them to save, or come back to it.
+🔀 merged into login.ts — 1 change, 1 shifted around live edits · open by alice
 ```
 
-The agent is told who is holding it and says so rather than retrying. The
-refusal is computed before the request is broadcast and applied in the same
-tick, so it is not a race an eager approver can win.
+Measured, not assumed: with Alice holding unsaved changes and typing into
+`login.ts` at the moment the agent wrote it, the agent's validation landed,
+both of Alice's lines survived, and her buffer and the file on disk ended
+byte-identical at 401 bytes.
 
-Not yet CRDT-backed shared buffers — the agent writes to disk and everyone
-reloads. That is honest for an MVP and enough to keep the failure mode above
-from ever happening; live co-editing is the next milestone.
+### When it cannot merge
+
+If someone has rewritten the very lines the agent meant to change, there is no
+correct merge. The human's version is kept, the hunk is **skipped**, and both
+the room and the agent are told:
+
+```
+⇄ merged into login.ts — 0 changes
+   1 of the agent's changes were not applied: someone had already rewritten
+   those lines. Their version was kept — ask the agent to look again.
+```
+
+The agent has to hear about it too, because the tool result says "written
+successfully" and that is true of disk and misleading about everything else.
+Told, it corrects itself rather than reporting work it did not do:
+
+> Heads up — my edit didn't land. Someone in the session rewrote that exact
+> line while I was working, and their version was kept instead of mine.
+
+That feedback rides `additionalContext` on a `PostToolUse` hook.
+`packages/agent-host/probe-posttool.mjs` checks the channel still reaches the
+model, and should be run after any SDK upgrade.
+
+### What this does not do
+
+- **Nothing is persisted.** A document lives only while somebody holds it open;
+  when the last editor closes it, disk is the truth again. That is deliberate —
+  a stale shared copy waiting to overwrite a file tomorrow is a worse failure
+  than the one it would prevent.
+- **No cursors or selections yet.** You see other people's text arrive, not
+  where they are.
+- **Files outside the workspace folder are not shared**, and neither are
+  untitled buffers.
+- Set `mpa.sharedBuffers` to false to turn all of it off, and the M2 behaviour
+  comes back: writes go to disk, and the relay refuses any write to a file
+  somebody has unsaved changes in —
+
+  ```
+  ⛔ system denied the tool call
+     bob has unsaved changes in that file. Ask them to save, or come back to it.
+  ```
+
+  That refusal still applies with shared buffers on, for files that are not
+  live. It is computed before the request is broadcast and applied in the same
+  tick, so it is not a race an eager approver can win.
+
+| Variable | Effect |
+| --- | --- |
+| `MPA_SHARED_BUFFERS=0` | agent-host: read and write disk directly, no merging |
+| `MPA_FLUSH_TIMEOUT_MS` | how long to wait for editors to save (relay 2s, agent-host 5s) |
+| `MPA_WRITE_GRACE_MS` | how long a path stays marked "the agent is writing this" after the merge, to cover a late reload (default 1.5s) |
+| `MPA_WRITE_LOCK_TIMEOUT_MS` | backstop release for a write that never reported (default 60s) |
 
 ## Auth
 
@@ -262,8 +343,9 @@ host's credentials.** Four layers, in order:
 2. `MPA_ALLOWED_TOOLS` (default `Read,Glob,Grep`) runs without asking. Reading
    is cheap and reversible; waiting on a human for it would make the session
    unusable without making it safer.
-3. Everything else **asks the room** and blocks until the driver decides. Writes
-   additionally cannot touch a file someone is still editing.
+3. Everything else **asks the room** and blocks until the driver decides. A
+   write to a file nobody has open as a shared document additionally cannot
+   touch it while someone has unsaved changes.
 4. `MPA_DISALLOWED_TOOLS` (empty by default) can be approved by nobody. Set it
    if you want a harder guarantee than "a human said yes".
 
@@ -278,7 +360,7 @@ shadowing the gate has to avoid — the SDK warns about this, and it is why laye
 - **M1 ✅** durable log, session resume, reconnection
 - **M2 ✅** driver token, suggestion queue, shared approval gate
 - **MVP ✅** agent writes with lost-update protection, one-command start, auth
-- **M3** CRDT buffers, so people and the agent edit the same live document
+- **M3 ✅** CRDT buffers: people and the agent edit the same live document
 - **M4** checkpoint rewind, session fork, audit export
 - **Hosting** relay on a server, TLS, real accounts, org-level billing
 
@@ -297,8 +379,17 @@ pnpm typecheck
 node tools/count-frames.mjs "In exactly 200 words, explain event sourcing."
 ```
 
-`packages/agent-host/probe-gate.mjs` checks that a denied tool call really does
-not execute — see "The approval gate" above.
+Two probes check assumptions about the SDK that the design rests on, and both
+should be re-run after an upgrade:
+
+```bash
+cd packages/agent-host
+node probe-gate.mjs deny   # a denied tool call must NOT execute
+node probe-posttool.mjs    # PostToolUse additionalContext must reach the model
+```
+
+The second is what lets the agent be told that part of its edit did not land.
+Without that channel it reports success for work it did not do.
 
 `count-frames.mjs` exists because an assumption cost real work. A buffering layer was added to
 the agent-host to coalesce "per-token" deltas; measurement showed this SDK

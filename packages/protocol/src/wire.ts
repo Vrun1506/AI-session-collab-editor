@@ -115,6 +115,66 @@ export const ClientMessage = z.discriminatedUnion("type", [
     dirty: z.array(z.string()),
   }),
 
+  // ---- shared buffers (M3) -------------------------------------------------
+  /**
+   * Editor -> relay: I have this file open, and here is what it says.
+   *
+   * The text seeds the shared document only if nobody has it open yet.
+   * Otherwise the relay's copy wins and this peer adopts it — someone else may
+   * be holding unsaved edits, and a joiner's view of disk must not erase them.
+   * `sv` is this peer's state vector so the reply carries only what it lacks.
+   */
+  z.object({
+    type: z.literal("docOpen"),
+    path: z.string(),
+    text: z.string(),
+    sv: z.string(),
+  }),
+  z.object({ type: z.literal("docClose"), path: z.string() }),
+  /** A Yjs update, base64-encoded — see `@mpa/crdt` for why it rides this
+   *  socket rather than a binary one of its own. */
+  z.object({
+    type: z.literal("docUpdate"),
+    path: z.string(),
+    update: z.string(),
+  }),
+  /** Editor -> relay: the save the relay asked for is done. */
+  z.object({ type: z.literal("docSaved"), path: z.string() }),
+
+  /**
+   * agent-host -> relay: I am about to run a tool that reads files. Make disk
+   * tell the truth first.
+   *
+   * Without this the agent reads the last saved version of a file somebody has
+   * been editing for ten minutes, and everything it concludes is about a file
+   * that no longer exists. `paths: null` means every live document, which is
+   * what a shell command needs — a test run should see what people are
+   * actually looking at.
+   */
+  z.object({
+    type: z.literal("docFlush"),
+    requestId: z.string(),
+    paths: z.array(z.string()).nullable(),
+    /** True when the tool is going to change the file, not just read it. Only
+     *  then do editors need to be told to expect a write. */
+    write: z.boolean(),
+  }),
+  /**
+   * agent-host -> relay: this file went from `before` to `after`.
+   *
+   * Sending both halves rather than just the result is what lets the relay
+   * merge the change into buffers people are still typing in, instead of
+   * overwriting them with the agent's idea of the file.
+   */
+  z.object({
+    type: z.literal("docWrote"),
+    writeId: z.string(),
+    path: z.string(),
+    before: z.string(),
+    after: z.string(),
+    turnId: z.string().nullable(),
+  }),
+
   z.object({ type: z.literal("ping") }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
@@ -164,6 +224,60 @@ export const ServerMessage = z.discriminatedUnion("type", [
     allow: z.boolean(),
     reason: z.string().optional(),
   }),
+  // ---- shared buffers (M3) -------------------------------------------------
+  /** Relay -> editor: everything you are missing for this document.
+   *  `seeded` says your text is what created it, so anything you typed while
+   *  the round trip was in flight is safe to keep. */
+  z.object({
+    type: z.literal("docState"),
+    path: z.string(),
+    update: z.string(),
+    seeded: z.boolean(),
+  }),
+  z.object({
+    type: z.literal("docUpdate"),
+    path: z.string(),
+    update: z.string(),
+    /** Whether a person or the agent wrote this, so editors can attribute it. */
+    by: z.enum(["peer", "agent"]),
+  }),
+  /** Relay -> editor: write this buffer to disk, the agent is about to read it. */
+  z.object({ type: z.literal("docSave"), path: z.string() }),
+  /** Relay -> agent-host: disk now matches the room. */
+  z.object({ type: z.literal("docFlushed"), requestId: z.string() }),
+  /**
+   * Relay -> editor: the agent is writing this path right now.
+   *
+   * Editors need to know because VS Code silently reloads an unmodified open
+   * file when it changes on disk. Pushing that reload back into the shared
+   * document would apply the agent's change a second time, concurrently with
+   * the relay's own merge — and two concurrent inserts of the same text is
+   * duplicated text, not convergence.
+   */
+  z.object({
+    type: z.literal("docLock"),
+    path: z.string(),
+    locked: z.boolean(),
+  }),
+
+  /**
+   * Relay -> agent-host: how the write actually landed in people's buffers.
+   *
+   * The tool result only says the file was written, which is true and can also
+   * be misleading: if someone had rewritten the very lines the agent changed,
+   * their version was kept and part of the change is simply not there. An agent
+   * that is not told this reports success for work that did not happen.
+   */
+  z.object({
+    type: z.literal("docMerged"),
+    writeId: z.string(),
+    /** False when nobody had the file open, so disk is the whole story. */
+    live: z.boolean(),
+    applied: z.number().int(),
+    moved: z.number().int(),
+    conflicts: z.number().int(),
+  }),
+
   z.object({ type: z.literal("pong") }),
   z.object({ type: z.literal("error"), message: z.string() }),
 ]);

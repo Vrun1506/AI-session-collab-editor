@@ -274,8 +274,8 @@
   /**
    * What the agent changed, for everyone rather than only the host.
    *
-   * VS Code reloads an unmodified open file from disk by itself, so a
-   * participant with the file open already sees the new content — but with no
+   * Anyone holding the file open already has the change — merged into their
+   * buffer if they were editing it, reloaded from disk if not — but with no
    * indication that it moved, or which of the twelve open files it was.
    */
   function renderChangedFiles() {
@@ -545,6 +545,28 @@
       case "file.changed": {
         changedFiles.set(b.path, (changedFiles.get(b.path) ?? 0) + 1);
         meta(`✎ ${b.tool} changed ${basename(b.path)}`);
+        break;
+      }
+
+      case "doc.merged": {
+        const detail = [`${b.applied} change(s)`];
+        if (b.moved > 0) detail.push(`${b.moved} shifted around live edits`);
+        const open = b.holders.length ? ` · open by ${b.holders.join(", ")}` : "";
+        meta(`⇄ merged into ${basename(b.path)} — ${detail.join(", ")}${open}`);
+
+        // A skipped hunk means part of the agent's change is simply not in the
+        // file. Nobody would guess that from a status line, so it gets said
+        // properly, next to the transcript it belongs to.
+        if (b.conflicts > 0) {
+          transcriptEl.appendChild(
+            addBlock(
+              "conflict",
+              `${basename(b.path)}`,
+              `${b.conflicts} of the agent's changes were not applied: someone had already ` +
+                "rewritten those lines. Their version was kept — ask the agent to look again.",
+            ),
+          );
+        }
         break;
       }
 

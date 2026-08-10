@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import WebSocket from "ws";
 import {
@@ -69,6 +70,18 @@ const disallowedTools = splitList(process.env.MPA_DISALLOWED_TOOLS ?? "");
  * a hang.
  */
 const approvalTimeoutMs = Number(process.env.MPA_APPROVAL_TIMEOUT_MS ?? 300_000);
+
+/**
+ * Whether file tools are routed through the room's shared documents.
+ *
+ * On, the agent reads what people are actually looking at and its writes are
+ * merged into their open buffers. Off, it reads and writes disk directly and
+ * the relay falls back to refusing writes to files anyone has unsaved.
+ */
+const sharedBuffers = process.env.MPA_SHARED_BUFFERS !== "0";
+
+/** How long to wait for the room to write its buffers out before reading. */
+const flushTimeoutMs = Number(process.env.MPA_FLUSH_TIMEOUT_MS ?? 5_000);
 
 const prompts = new AsyncQueue<SDKUserMessage>();
 const translator = new TurnTranslator();
@@ -201,6 +214,21 @@ function connect(): void {
         settleApproval(msg.requestId, msg.allow, msg.reason);
         break;
       }
+      case "docFlushed": {
+        pendingFlushes.get(msg.requestId)?.();
+        pendingFlushes.delete(msg.requestId);
+        break;
+      }
+      case "docMerged": {
+        pendingWrites.get(msg.writeId)?.({
+          live: msg.live,
+          applied: msg.applied,
+          moved: msg.moved,
+          conflicts: msg.conflicts,
+        });
+        pendingWrites.delete(msg.writeId);
+        break;
+      }
       case "error": {
         console.error("[agent-host] relay error:", msg.message);
         // Retrying a rejected credential just produces the same rejection
@@ -324,8 +352,128 @@ async function askTheRoom(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Shared documents
+// ---------------------------------------------------------------------------
+
 /** Tools whose effect is a file on disk changing. */
 const WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+
+/** Tools that read one named file. */
+const READ_TOOLS = new Set(["Read", "NotebookRead"]);
+
+/**
+ * Tools that could touch anything.
+ *
+ * A shell command may read the whole tree, and a test run that sees the last
+ * saved version of a file somebody has been editing for ten minutes produces a
+ * result about a project that does not exist. So these flush every live
+ * document, not one path.
+ */
+const BROAD_TOOLS = new Set(["Bash", "Grep"]);
+
+function toolPath(toolName: string, input: unknown): string | null {
+  if (!WRITE_TOOLS.has(toolName) && !READ_TOOLS.has(toolName)) return null;
+  if (!input || typeof input !== "object") return null;
+  const record = input as Record<string, unknown>;
+  const raw =
+    record["file_path"] ?? record["notebook_path"] ?? record["path"];
+  return typeof raw === "string" && raw.length > 0 ? resolve(cwd, raw) : null;
+}
+
+const pendingFlushes = new Map<string, () => void>();
+
+/**
+ * Ask the room to write its unsaved buffers to disk, and wait.
+ *
+ * The editors do the saving rather than this process writing the files itself,
+ * which matters: VS Code reloading a file that changed underneath a dirty
+ * buffer means a conflict prompt, and nobody wants one of those every time the
+ * agent reads something. Their own save is silent and leaves the buffer clean.
+ */
+function flushRoom(paths: string[] | null, write: boolean): Promise<void> {
+  if (!sharedBuffers) return Promise.resolve();
+
+  const requestId = randomUUID();
+  return new Promise<void>((done) => {
+    const timer = setTimeout(() => {
+      pendingFlushes.delete(requestId);
+      console.warn("[agent-host] no flush reply; reading disk as it stands");
+      done();
+    }, flushTimeoutMs);
+    timer.unref?.();
+
+    pendingFlushes.set(requestId, () => {
+      clearTimeout(timer);
+      done();
+    });
+    sendToRelay({ type: "docFlush", requestId, paths, write });
+  });
+}
+
+/**
+ * What a file said just before the agent changed it.
+ *
+ * Keyed by path because the SDK runs a tool to completion before the next one
+ * starts, so a path can only be mid-write once. Holding the before-text is what
+ * lets the relay merge the change into somebody's open buffer rather than
+ * replacing it — without it all we could offer the room is the finished file.
+ */
+const beforeText = new Map<string, string>();
+
+interface MergeResult {
+  live: boolean;
+  applied: number;
+  moved: number;
+  conflicts: number;
+}
+
+const pendingWrites = new Map<string, (result: MergeResult | null) => void>();
+
+/**
+ * Hand a write to the relay and wait to hear how it landed.
+ *
+ * Waiting at all is a deliberate cost: the alternative is finishing the tool
+ * call before anyone knows whether the change survived contact with the people
+ * editing the file. The deadline is short because a room that has gone quiet
+ * must not stall the agent.
+ */
+function reportWrite(
+  path: string,
+  before: string,
+  after: string,
+): Promise<MergeResult | null> {
+  const writeId = randomUUID();
+  return new Promise<MergeResult | null>((done) => {
+    const timer = setTimeout(() => {
+      pendingWrites.delete(writeId);
+      done(null);
+    }, flushTimeoutMs);
+    timer.unref?.();
+
+    pendingWrites.set(writeId, (result) => {
+      clearTimeout(timer);
+      done(result);
+    });
+    sendToRelay({
+      type: "docWrote",
+      writeId,
+      path,
+      before,
+      after,
+      turnId: translator.openTurnId,
+    });
+  });
+}
+
+function readOrEmpty(path: string): string {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    // A Write that creates a file has no before-text, which is not an error.
+    return "";
+  }
+}
 
 /**
  * Tell the room which files actually changed.
@@ -338,37 +486,89 @@ const reportFileChange: HookCallback = async (input) => {
   if (input.hook_event_name !== "PostToolUse") return {};
   if (!WRITE_TOOLS.has(input.tool_name)) return {};
 
-  const toolInput = input.tool_input as Record<string, unknown> | undefined;
-  const raw =
-    toolInput?.["file_path"] ?? toolInput?.["notebook_path"] ?? toolInput?.["path"];
-  if (typeof raw !== "string" || !raw) return {};
+  const path = toolPath(input.tool_name, input.tool_input);
+  if (!path) return {};
 
   publish({
     type: "file.changed",
-    path: resolve(cwd, raw),
+    path,
     turnId: translator.openTurnId,
     tool: input.tool_name,
   });
+
+  // Both halves of the change go to the relay, which folds it into whatever
+  // the file's readers are looking at now — including anything typed while
+  // this tool was running.
+  if (!sharedBuffers || !beforeText.has(path)) return {};
+
+  const before = beforeText.get(path)!;
+  beforeText.delete(path);
+  const merge = await reportWrite(path, before, readOrEmpty(path));
+
+  // "Written successfully" is true and, when a hunk was skipped, misleading:
+  // that part of the change is not in the file anyone is looking at. Saying so
+  // here is the difference between the agent correcting itself and the agent
+  // confidently reporting work it did not do.
+  if (merge && merge.conflicts > 0) {
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PostToolUse",
+        additionalContext:
+          `Your write to ${path} succeeded on disk, but ${merge.conflicts} ` +
+          "part(s) of it were NOT applied to the copy people are editing: " +
+          "somebody had already rewritten those exact lines while you were " +
+          "working, and their version was kept. Their copy is the one that " +
+          "counts — it will overwrite the file the next time it is saved — so " +
+          "do not describe this edit as done. Say plainly which part did not " +
+          "land and that someone else had changed those lines, and let the room " +
+          "decide. Do not try to write the file again.",
+      },
+    };
+  }
   return {};
 };
 
 const gateToolCall: HookCallback = async (input, _toolUseId, options) => {
   if (input.hook_event_name !== "PreToolUse") return {};
   const toolName = input.tool_name;
+
   // Reading is cheap, reversible and constant, so waiting on a human for it
   // would make the session unusable without making it meaningfully safer.
-  if (autoApproved.has(toolName)) return {};
+  // Everything else is suspended until the room decides.
+  if (!autoApproved.has(toolName)) {
+    const decision = await askTheRoom(
+      toolName,
+      input.tool_input,
+      options.signal,
+    );
+    if (!decision.allow) {
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason:
+            decision.reason ?? "The room declined this tool call.",
+        },
+      };
+    }
+  }
 
-  const decision = await askTheRoom(toolName, input.tool_input, options.signal);
+  // Approved — now make disk agree with the room before the tool looks at it.
+  const path = toolPath(toolName, input.tool_input);
+  const write = WRITE_TOOLS.has(toolName);
+  if (path) {
+    await flushRoom([path], write);
+    if (write) beforeText.set(path, readOrEmpty(path));
+  } else if (BROAD_TOOLS.has(toolName)) {
+    await flushRoom(null, false);
+  }
+
+  if (autoApproved.has(toolName)) return {};
   return {
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
-      permissionDecision: decision.allow ? "allow" : "deny",
-      permissionDecisionReason:
-        decision.reason ??
-        (decision.allow
-          ? "Approved in the shared session."
-          : "The room declined this tool call."),
+      permissionDecision: "allow",
+      permissionDecisionReason: "Approved in the shared session.",
     },
   };
 };
@@ -389,6 +589,12 @@ so prompts in one turn may come from a different person than the last.
 The workspace root is ${cwd}. All file paths you use must be relative to that \
 root or absolute beneath it; a leading "/" means the filesystem root, not the \
 project. Prefer Glob or Grep over guessing a path.
+
+People may have this project open and be editing it as you work. Before you \
+read a file its editors write out their unsaved changes, so what you read is \
+current — and when you write a file, your change is merged into the buffers \
+they have open rather than replacing them. You do not need to do anything \
+about this; just do not assume a file is unchanged since you last read it.
 
 Most of your tools pause for a human decision before they run, and the room \
 sees the arguments you asked for. Prefer one clear, complete change over a \
@@ -452,6 +658,13 @@ console.log(
   `[agent-host] auto-approved: ${[...autoApproved].join(", ") || "none"} · ` +
     `never allowed: ${disallowedTools.join(", ") || "none"} · ` +
     "everything else asks the room",
+);
+console.log(
+  `[agent-host] shared buffers: ${
+    sharedBuffers
+      ? "on — reads see unsaved work, writes merge into open editors"
+      : "off — reads and writes go straight to disk"
+  }`,
 );
 connect();
 

@@ -89,6 +89,11 @@
           "default": "Read,Glob,Grep",
           "description": "Comma-separated tools the shared agent may run without asking. Everything else goes to the room for approval."
         },
+        "mpa.sharedBuffers": {
+          "type": "boolean",
+          "default": true,
+          "description": "Share open files as live documents, so several people and the agent can edit one file at once and agent writes merge into your buffer instead of reloading it. Turn off to fall back to disk writes, where the relay refuses any write to a file someone has unsaved changes in."
+        },
         "mpa.disallowedTools": {
           "type": "string",
           "default": "",
@@ -103,6 +108,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@mpa/crdt": "workspace:*",
     "@mpa/protocol": "workspace:*",
     "ws": "^8.18.0"
   },

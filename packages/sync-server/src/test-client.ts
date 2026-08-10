@@ -16,7 +16,23 @@
  *                      pretend to be holding these files with unsaved changes,
  *                      which is how the write-conflict guard gets exercised
  *                      without opening an editor
+ *
+ * Shared buffers (M3). These make it a real editor peer rather than a viewer:
+ *   MPA_OPEN=src/a.ts,src/b.ts
+ *                      hold these files open as shared documents
+ *   MPA_UNSAVED=text    type this into every open document without saving, so
+ *                      disk and the room disagree the way they do when someone
+ *                      is mid-edit
+ *   MPA_TYPE_ON_LOCK=text
+ *                      type this the instant the agent starts writing a file —
+ *                      the race the whole milestone is about
+ *   MPA_REPLACE_ON_LOCK=old>>new
+ *                      rewrite this text the instant the agent starts writing.
+ *                      Aim it at the lines the agent is about to change and the
+ *                      merge should report a conflict rather than overwrite you
  */
+import { readFileSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import WebSocket from "ws";
 import {
   DEFAULT_RELAY_URL,
@@ -27,6 +43,7 @@ import {
   type SessionEvent,
 } from "@mpa/protocol";
 import { readLocalToken } from "@mpa/protocol/token";
+import { applyUpdate, encodeUpdate, stateVector, textOf, Y } from "@mpa/crdt";
 
 const name = process.argv[2] ?? "tester";
 const prompt = process.argv[3];
@@ -42,6 +59,14 @@ const dirty = (process.env.MPA_DIRTY ?? "")
   .split(",")
   .map((p) => p.trim())
   .filter(Boolean);
+const openPaths = (process.env.MPA_OPEN ?? "")
+  .split(",")
+  .map((p) => p.trim())
+  .filter(Boolean)
+  .map((p) => resolve(p));
+const unsavedText = process.env.MPA_UNSAVED;
+const typeOnLock = process.env.MPA_TYPE_ON_LOCK;
+const replaceOnLock = (process.env.MPA_REPLACE_ON_LOCK ?? "").split(">>");
 
 let driving = false;
 
@@ -152,6 +177,20 @@ function render(event: SessionEvent, replay: boolean): void {
     );
     return;
   }
+  if (isEvent(event, "doc.merged")) {
+    const b = event.body;
+    console.log(
+      `[${tag}] 🔀 merged into ${b.path} — ${b.applied} change(s)` +
+        `${b.moved ? `, ${b.moved} relocated` : ""}` +
+        `${b.conflicts ? `, ${b.conflicts} SKIPPED as conflicts` : ""}` +
+        `${b.holders.length ? ` · open by ${b.holders.join(", ")}` : ""}`,
+    );
+    return;
+  }
+  if (isEvent(event, "file.changed")) {
+    console.log(`[${tag}] 📝 ${event.body.tool} wrote ${event.body.path}`);
+    return;
+  }
   if (isEvent(event, "agent.status")) {
     console.log(
       `[${tag}] agent: ${event.body.state}${event.body.detail ? ` — ${event.body.detail}` : ""}`,
@@ -159,6 +198,44 @@ function render(event: SessionEvent, replay: boolean): void {
     return;
   }
   console.log(`[${tag}] ${event.body.type} (${who})`);
+}
+
+// ---------------------------------------------------------------------------
+// Shared documents — a stand-in for an editor holding files open
+// ---------------------------------------------------------------------------
+
+const shared = new Map<string, Y.Doc>();
+
+function openShared(path: string): void {
+  const doc = new Y.Doc();
+  shared.set(path, doc);
+
+  doc.on("update", (update: Uint8Array, _origin: unknown, _doc, tr) => {
+    if (tr.local) send({ type: "docUpdate", path, update: encodeUpdate(update) });
+  });
+
+  let text = "";
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    // Holding a file open that does not exist yet is a fair thing to do.
+  }
+  send({ type: "docOpen", path, text, sv: stateVector(doc) });
+}
+
+/** Type into a document without writing it out, the way a person does. */
+function typeInto(doc: Y.Doc, text: string): void {
+  const ytext = textOf(doc);
+  doc.transact(() => ytext.insert(ytext.length, text), "local");
+}
+
+function dumpShared(): void {
+  for (const [path, doc] of shared) {
+    const text = textOf(doc).toString();
+    console.log(
+      `\n[${name}] ${path} — ${text.length} chars in the shared document:\n${text}`,
+    );
+  }
 }
 
 socket.on("open", () => {
@@ -187,6 +264,7 @@ socket.on("message", (raw) => {
       console.log(`[${name}] holding unsaved: ${dirty.join(", ")}`);
       send({ type: "bufferState", dirty });
     }
+    for (const path of openPaths) openShared(path);
     if (wantsDriver && !driving) send({ type: "requestDriver" });
     if (prompt) {
       // Whether this lands as a prompt or a suggestion is the relay's call.
@@ -205,10 +283,77 @@ socket.on("message", (raw) => {
     );
     return;
   }
+  if (msg.type === "docState") {
+    const doc = shared.get(msg.path);
+    if (!doc) return;
+    applyUpdate(doc, msg.update, "remote");
+    console.log(
+      `[${name}] 📄 ${msg.path} ${msg.seeded ? "seeded from disk" : "adopted from the room"} — ${textOf(doc).length} chars`,
+    );
+    // Unsaved work: the room's copy now says something disk does not.
+    if (unsavedText) {
+      typeInto(doc, unsavedText);
+      console.log(`[${name}] ✍️  typed (unsaved): ${unsavedText.trim()}`);
+      send({ type: "bufferState", dirty: [...shared.keys()] });
+    }
+    return;
+  }
+  if (msg.type === "docUpdate") {
+    const doc = shared.get(msg.path);
+    if (!doc) return;
+    applyUpdate(doc, msg.update, msg.by === "agent" ? "agent" : "remote");
+    console.log(
+      `[${name}] 📄 ${msg.by} changed ${msg.path} — now ${textOf(doc).length} chars`,
+    );
+    return;
+  }
+  if (msg.type === "docSave") {
+    // A real editor writes its buffer; so do we, or the agent reads a file
+    // that disagrees with what everyone is looking at.
+    const doc = shared.get(msg.path);
+    if (doc) {
+      writeFileSync(msg.path, textOf(doc).toString());
+      console.log(`[${name}] 💾 saved ${msg.path} for the agent`);
+    }
+    send({ type: "docSaved", path: msg.path });
+    return;
+  }
+  if (msg.type === "docLock") {
+    console.log(
+      `[${name}] ${msg.locked ? "🔒 agent is writing" : "🔓 agent finished"} ${msg.path}`,
+    );
+    const doc = shared.get(msg.path);
+    if (msg.locked && doc && typeOnLock) {
+      typeInto(doc, typeOnLock);
+      console.log(`[${name}] ✍️  typed while the agent was writing`);
+    }
+    if (msg.locked && doc && replaceOnLock.length === 2) {
+      const [from, to] = replaceOnLock as [string, string];
+      const ytext = textOf(doc);
+      const at = ytext.toString().indexOf(from);
+      if (at === -1) {
+        console.log(`[${name}] ⚠️  nothing matching "${from}" to rewrite`);
+      } else {
+        doc.transact(() => {
+          ytext.delete(at, from.length);
+          ytext.insert(at, to);
+        }, "local");
+        console.log(`[${name}] ✍️  rewrote "${from}" while the agent was writing`);
+      }
+    }
+    return;
+  }
   if (msg.type === "error") {
     console.error(`[${name}] relay error: ${msg.message}`);
   }
 });
+
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, () => {
+    dumpShared();
+    process.exit(0);
+  });
+}
 
 socket.on("error", (err) => {
   console.error(`[${name}] socket error:`, err.message);

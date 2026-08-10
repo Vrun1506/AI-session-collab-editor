@@ -16,6 +16,17 @@ export interface SessionHandlers {
   /** Who the relay thinks we are — the panel needs it to know whether the
    *  driver token in the folded log is ours. */
   onIdentity(you: Participant): void;
+
+  // ---- shared documents (M3) ----------------------------------------------
+  onDocState(path: string, update: string, seeded: boolean): void;
+  onDocUpdate(path: string, update: string, by: "peer" | "agent"): void;
+  onDocSave(path: string): void;
+  onDocLock(path: string, locked: boolean): void;
+  /**
+   * The relay forgot our open documents while we were away — it must, or a
+   * departed peer's copy would outlive them — so they are announced again.
+   */
+  onResync(): void;
 }
 
 export interface SessionConfig {
@@ -29,6 +40,9 @@ export interface SessionConfig {
   workspaceDir: string;
   allowedTools: string;
   disallowedTools: string;
+  /** Whether files are shared as live CRDT documents rather than reloaded
+   *  from disk after the agent writes them. */
+  sharedBuffers: boolean;
   /** Undefined means "try the local relay's token file". */
   token: string | undefined;
   /** Surfaced loudly, unlike `onStatus` — a shared agent that never started is
@@ -98,6 +112,7 @@ export class RoomSession {
         MPA_RELAY_URL: this.config.relayUrl,
         MPA_ALLOWED_TOOLS: this.config.allowedTools,
         MPA_DISALLOWED_TOOLS: this.config.disallowedTools,
+        MPA_SHARED_BUFFERS: this.config.sharedBuffers ? "1" : "0",
       },
       stdio: ["ignore", "pipe", "pipe"],
       detached: true,
@@ -169,6 +184,9 @@ export class RoomSession {
             this.handlers.onEvent(event, true);
           }
           this.handlers.onParticipants(msg.participants);
+          // Our open files are presence, not history: the relay dropped them
+          // when the socket went, so they have to be announced again.
+          if (this.config.sharedBuffers) this.handlers.onResync();
           break;
         case "event":
           this.trackSeq(msg.event.seq);
@@ -176,6 +194,18 @@ export class RoomSession {
           break;
         case "participants":
           this.handlers.onParticipants(msg.participants);
+          break;
+        case "docState":
+          this.handlers.onDocState(msg.path, msg.update, msg.seeded);
+          break;
+        case "docUpdate":
+          this.handlers.onDocUpdate(msg.path, msg.update, msg.by);
+          break;
+        case "docSave":
+          this.handlers.onDocSave(msg.path);
+          break;
+        case "docLock":
+          this.handlers.onDocLock(msg.path, msg.locked);
           break;
         case "error":
           this.handlers.onStatus(`relay error: ${msg.message}`);
@@ -269,6 +299,24 @@ export class RoomSession {
   sendBufferState(dirty: string[]): void {
     this.dirty = dirty;
     this.send({ type: "bufferState", dirty });
+  }
+
+  // ---- shared documents ----------------------------------------------------
+
+  openDoc(path: string, text: string, sv: string): void {
+    this.send({ type: "docOpen", path, text, sv });
+  }
+
+  closeDoc(path: string): void {
+    this.send({ type: "docClose", path });
+  }
+
+  sendDocUpdate(path: string, update: string): void {
+    this.send({ type: "docUpdate", path, update });
+  }
+
+  confirmSaved(path: string): void {
+    this.send({ type: "docSaved", path });
   }
 
   decideApproval(requestId: string, allow: boolean, reason?: string): void {

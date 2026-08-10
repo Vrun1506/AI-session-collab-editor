@@ -2,11 +2,13 @@ import * as os from "node:os";
 import * as vscode from "vscode";
 import { revealChangedFile, watchDirtyBuffers } from "./buffers.js";
 import { ensureRelay, resolveServerPaths } from "./bootstrap.js";
+import { DocSync } from "./docsync.js";
 import { AgentPanel } from "./panel.js";
 import { RoomSession } from "./session.js";
 
 let session: RoomSession | undefined;
 let panel: AgentPanel | undefined;
+let docSync: DocSync | undefined;
 let bufferWatch: vscode.Disposable | undefined;
 let statusItem: vscode.StatusBarItem | undefined;
 
@@ -119,10 +121,13 @@ async function startSession(
   const workspaceDir =
     vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? os.homedir();
   const cfg = config();
+  const sharedBuffers = cfg.get<boolean>("sharedBuffers") ?? true;
 
   // One room at a time keeps things honest; multi-room comes with the sidebar.
   session?.dispose();
   panel?.dispose();
+  docSync?.dispose();
+  docSync = undefined;
   bufferWatch?.dispose();
 
   // The panel comes up before the relay is contacted, so that starting one has
@@ -170,6 +175,7 @@ async function startSession(
       workspaceDir,
       allowedTools: cfg.get<string>("allowedTools") ?? "Read,Glob,Grep",
       disallowedTools: cfg.get<string>("disallowedTools") ?? "",
+      sharedBuffers,
       token: setting("token"),
       onFatal: (message) => {
         void vscode.window.showErrorMessage(message);
@@ -180,12 +186,34 @@ async function startSession(
       onParticipants: (participants) => panel?.postParticipants(participants),
       onStatus: (text) => panel?.postStatus(text),
       onIdentity: (you) => panel?.postIdentity(you),
+      onDocState: (path, update, seeded) =>
+        docSync?.onState(path, update, seeded),
+      onDocUpdate: (path, update, by) => docSync?.onUpdate(path, update, by),
+      onDocSave: (path) => void docSync?.onSaveRequest(path),
+      onDocLock: (path, locked) => docSync?.onLock(path, locked),
+      onResync: () => docSync?.reattachAll(),
     },
   );
   session.start();
 
-  // The relay refuses agent writes to files anyone is still editing, which
-  // only works if it knows what those are.
+  if (sharedBuffers) {
+    // Files become live shared documents: everyone edits one text, and the
+    // agent's writes merge into it rather than landing on disk for people to
+    // reload over whatever they were typing.
+    docSync = new DocSync(
+      {
+        openDoc: (path, text, sv) => session?.openDoc(path, text, sv),
+        closeDoc: (path) => session?.closeDoc(path),
+        sendUpdate: (path, update) => session?.sendDocUpdate(path, update),
+        confirmSaved: (path) => session?.confirmSaved(path),
+      },
+      (message) => panel?.postStatus(message),
+    );
+    docSync.start();
+  }
+
+  // Files nobody has open as a shared document are still protected the M2 way:
+  // the relay refuses an agent write that would destroy unsaved changes.
   bufferWatch = watchDirtyBuffers((paths) => session?.sendBufferState(paths));
   context.subscriptions.push(bufferWatch);
 
@@ -231,6 +259,8 @@ export function deactivate(): void {
   session = undefined;
   panel?.dispose();
   panel = undefined;
+  docSync?.dispose();
+  docSync = undefined;
   bufferWatch?.dispose();
   bufferWatch = undefined;
   statusItem?.dispose();
