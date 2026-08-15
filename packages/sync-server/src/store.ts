@@ -19,6 +19,17 @@ export interface EventStore {
   /** The Agent SDK session backing a room, so context survives a restart. */
   getAgentSessionId(roomId: string): string | null;
   setAgentSessionId(roomId: string, sessionId: string): void;
+  /**
+   * Copy `from`'s history below `uptoSeq` into `to`, for a session fork.
+   *
+   * Sequence numbers are carried over rather than renumbered, so the two logs
+   * agree about the shared prefix and a checkpoint means the same thing in
+   * both. Refuses a target that already has events: a fork that silently
+   * interleaved itself with an existing room's log would be unrecoverable.
+   *
+   * @returns how many events were copied
+   */
+  copyRoom(from: string, to: string, uptoSeq: number): number;
   close(): void;
 }
 
@@ -60,6 +71,17 @@ export class MemoryEventStore implements EventStore {
 
   setAgentSessionId(roomId: string, sessionId: string): void {
     this.agentSessions.set(roomId, sessionId);
+  }
+
+  copyRoom(from: string, to: string, uptoSeq: number): number {
+    if (this.bucket(to).length > 0) {
+      throw new Error(`room ${to} already has history`);
+    }
+    const copied = this.bucket(from)
+      .filter((e) => e.seq < uptoSeq)
+      .map((e) => ({ ...e, roomId: to }));
+    this.events.set(to, copied);
+    return copied.length;
   }
 
   close(): void {}
@@ -156,6 +178,22 @@ export class SqliteEventStore implements EventStore {
                                             updated_at = excluded.updated_at`,
       )
       .run(roomId, sessionId, Date.now());
+  }
+
+  copyRoom(from: string, to: string, uptoSeq: number): number {
+    if (this.latestSeq(to) >= 0) {
+      throw new Error(`room ${to} already has history`);
+    }
+    // One statement, so a fork either lands whole or not at all — a half-copied
+    // log would be a room whose history stops mid-turn with no way to tell.
+    const result = this.db
+      .prepare(
+        `INSERT INTO events (room_id, seq, ts, actor, body)
+         SELECT ?, seq, ts, actor, body FROM events
+         WHERE room_id = ? AND seq < ?`,
+      )
+      .run(to, from, uptoSeq);
+    return Number(result.changes ?? 0);
   }
 
   close(): void {

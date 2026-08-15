@@ -31,6 +31,19 @@
   const items = new Map();
   let lastSeq = -1;
 
+  /**
+   * Event types this panel deliberately does not render.
+   *
+   * Everything else that reaches the switch's `default` is reported to the
+   * console, so adding an event type to the protocol and forgetting the UI
+   * shows up as a complaint rather than as a silent hole in the transcript.
+   */
+  const SILENT = new Set([
+    // One per turn, recorded so the room can be rewound to it. Rendering every
+    // one would be pure noise; the rewind that uses it is what people see.
+    "checkpoint.created",
+  ]);
+
   // ---- folded state -------------------------------------------------------
 
   /** @type {{userId: string, name: string} | null} */
@@ -438,6 +451,10 @@
 
     const b = event.body;
     const who = actorName(event.actor);
+    // Where the transcript ended before this event, so anything it renders can
+    // be stamped with the seq that produced it. That stamp is what lets a
+    // rewind take exactly its own range back off the screen.
+    const renderedBefore = transcriptEl.childElementCount;
 
     // Any real output means the agent is no longer merely pending.
     if (
@@ -651,10 +668,85 @@
         meta(`agent ${b.state}${b.detail ? ` — ${b.detail}` : ""}`);
         break;
       }
+
+      // ---- checkpoints, rewind and fork (M4) -----------------------------
+      case "checkpoint.restored": {
+        // The same rule the relay applies when replaying to a late joiner:
+        // the superseded range stops counting. Doing it here as well is what
+        // makes someone who watched the turn happen end up looking at the
+        // same transcript as someone who arrives afterwards.
+        dropRange(b.fromSeq, event.seq);
+        const parts = [`⏪ ${who} rewound the session to “${b.label}”`];
+        if (b.filesChanged.length > 0) {
+          parts.push(
+            `${b.filesChanged.length} file(s) restored (+${b.insertions}/-${b.deletions})`,
+          );
+        }
+        if (b.skippedLinks > 0) {
+          parts.push(
+            `⚠️ ${b.skippedLinks} NOT restored — unsafe symlink or moved directory`,
+          );
+        }
+        meta(parts.join(" · "));
+        break;
+      }
+
+      case "checkpoint.failed": {
+        meta(`⚠️ rewind failed — ${b.reason}`);
+        break;
+      }
+
+      case "room.forked": {
+        meta(
+          b.toRoomId
+            ? `🌿 ${who} forked “${b.label}” into room ${b.toRoomId} — this room carries on`
+            : `🌿 branched from ${b.fromRoomId ?? "another room"} at “${b.label}”`,
+        );
+        break;
+      }
+
+      default: {
+        // An event type nobody renders is almost always one somebody forgot,
+        // and it used to fail silently: the transcript simply had a hole in it.
+        // Types that are deliberately invisible are named in SILENT above, so
+        // anything reaching here is worth a complaint in the devtools console.
+        if (!SILENT.has(b.type)) {
+          console.warn(`[panel] no renderer for event type "${b.type}"`);
+        }
+        break;
+      }
+    }
+
+    // Stamp whatever this event just rendered, so a later rewind can find it.
+    for (let i = renderedBefore; i < transcriptEl.childElementCount; i++) {
+      transcriptEl.children[i].dataset.seq = String(event.seq);
     }
 
     scrollToEnd();
     scheduleRender();
+  }
+
+  /**
+   * Take a superseded stretch of transcript back off the screen.
+   *
+   * Half-open `[from, to)`. This is the third implementation of that rule —
+   * the relay and the extension share `withinRange` from `@mpa/protocol`, but
+   * a webview script cannot import it, so this copy is deliberate. Keep it in
+   * step with `protocol/src/checkpoints.ts`.
+   *
+   * Elements carry the seq that produced them, so this removes exactly the
+   * range the rewind abandoned and leaves everything before it untouched.
+   */
+  function dropRange(from, to) {
+    for (const el of [...transcriptEl.children]) {
+      const seq = Number(el.dataset.seq);
+      if (Number.isFinite(seq) && seq >= from && seq < to) el.remove();
+    }
+    // Anything keyed to a removed bubble would otherwise be reused by a later
+    // message with the same id and reappear inside the rewound range.
+    for (const [key, entry] of items) {
+      if (!entry.el.isConnected) items.delete(key);
+    }
   }
 
   /** Attribute a turn's cost to whoever's prompt started it. */

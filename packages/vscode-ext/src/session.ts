@@ -3,6 +3,7 @@ import WebSocket from "ws";
 import {
   decodeServer,
   encode,
+  withinRange,
   type ClientMessage,
   type Participant,
   type SessionEvent,
@@ -27,6 +28,17 @@ export interface SessionHandlers {
    * departed peer's copy would outlive them — so they are announced again.
    */
   onResync(): void;
+
+  /** The rendered audit log came back from the relay. */
+  onAuditReport(roomId: string, markdown: string): void;
+}
+
+/** A point this room can be taken back to, or branched from. */
+export interface CheckpointRef {
+  checkpointId: string;
+  label: string;
+  seq: number;
+  ts: number;
 }
 
 export interface SessionConfig {
@@ -80,6 +92,14 @@ export class RoomSession {
    */
   private dirty: string[] = [];
   private readonly token: string | undefined;
+  /**
+   * Rewindable points, folded from the log exactly as the relay folds them.
+   *
+   * Kept here rather than read back from the relay so the command can offer a
+   * list without a round trip — and folded from the same events, so it cannot
+   * drift into offering a checkpoint the relay would refuse.
+   */
+  private readonly checkpoints = new Map<string, CheckpointRef>();
 
   constructor(
     private readonly config: SessionConfig,
@@ -181,6 +201,7 @@ export class RoomSession {
           // events land on top.
           for (const event of msg.backlog) {
             this.trackSeq(event.seq);
+            this.trackCheckpoints(event);
             this.handlers.onEvent(event, true);
           }
           this.handlers.onParticipants(msg.participants);
@@ -190,7 +211,11 @@ export class RoomSession {
           break;
         case "event":
           this.trackSeq(msg.event.seq);
+          this.trackCheckpoints(msg.event);
           this.handlers.onEvent(msg.event, false);
+          break;
+        case "auditReport":
+          this.handlers.onAuditReport(msg.roomId, msg.markdown);
           break;
         case "participants":
           this.handlers.onParticipants(msg.participants);
@@ -233,6 +258,38 @@ export class RoomSession {
 
   private trackSeq(seq: number): void {
     if (seq > this.lastSeq) this.lastSeq = seq;
+  }
+
+  /**
+   * Keep the rewind list in step with the log.
+   *
+   * A rewind takes back the checkpoints inside the range it superseded along
+   * with everything else in it. Leaving them on the menu would offer people a
+   * point that no longer exists in the transcript they are looking at.
+   */
+  private trackCheckpoints(event: SessionEvent): void {
+    const body = event.body;
+    if (body.type === "checkpoint.created") {
+      this.checkpoints.set(body.checkpointId, {
+        checkpointId: body.checkpointId,
+        label: body.label,
+        seq: event.seq,
+        ts: event.ts,
+      });
+    } else if (body.type === "checkpoint.restored") {
+      // The same rule the relay applies, from the same function — two copies of
+      // a half-open interval would drift into one client offering a checkpoint
+      // the others had already discarded.
+      const abandoned = { fromSeq: body.fromSeq, toSeq: event.seq };
+      for (const [id, cp] of this.checkpoints) {
+        if (withinRange(abandoned, cp.seq)) this.checkpoints.delete(id);
+      }
+    }
+  }
+
+  /** Rewindable points, newest first — the one you want is usually the last. */
+  listCheckpoints(): CheckpointRef[] {
+    return [...this.checkpoints.values()].sort((a, b) => b.seq - a.seq);
   }
 
   /**
@@ -326,6 +383,20 @@ export class RoomSession {
       allow,
       ...(reason ? { reason } : {}),
     });
+  }
+
+  // ---- checkpoints, rewind and fork (M4) -----------------------------------
+
+  rewindTo(checkpointId: string): void {
+    this.send({ type: "rewindTo", checkpointId });
+  }
+
+  forkRoom(checkpointId: string, toRoomId: string): void {
+    this.send({ type: "forkRoom", checkpointId, toRoomId });
+  }
+
+  requestAudit(): void {
+    this.send({ type: "requestAudit" });
   }
 
   /**

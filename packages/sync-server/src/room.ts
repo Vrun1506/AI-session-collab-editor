@@ -1,8 +1,11 @@
-import type {
-  EventDraft,
-  Identity,
-  Participant,
-  SessionEvent,
+import {
+  isSuperseded,
+  withinRange,
+  type EventDraft,
+  type Identity,
+  type Participant,
+  type SessionEvent,
+  type SupersededRange,
 } from "@mpa/protocol";
 import { MemoryEventStore, type EventStore } from "./store.js";
 
@@ -22,6 +25,28 @@ export interface Approval {
   turnId: string | null;
   decision: { allow: boolean; reason?: string } | null;
 }
+
+/**
+ * A point the room can be taken back to, or branched from.
+ *
+ * `fromSeq` is where the turn began in our log and `userMessageId`/`resumeAt`
+ * are where it began in the SDK's. Holding both is the whole job: a rewind has
+ * to move the transcript, the files and the agent's memory together, and no two
+ * of those three are addressed the same way.
+ */
+export interface Checkpoint {
+  checkpointId: string;
+  /** Seq of the `checkpoint.created` event itself. */
+  seq: number;
+  /** Seq of the prompt that opened the turn — the first thing a rewind hides. */
+  fromSeq: number;
+  turnId: string | null;
+  label: string;
+  userMessageId: string;
+  resumeAt: string | null;
+  ts: number;
+}
+
 
 /**
  * Room state, kept free of any transport concerns so the ordering and replay
@@ -50,6 +75,12 @@ export class Room {
   private readonly driverQueue: Identity[] = [];
   private readonly suggestions = new Map<string, Suggestion>();
   private readonly approvals = new Map<string, Approval>();
+  private readonly checkpoints = new Map<string, Checkpoint>();
+  /** promptId -> the seq it was logged at, so a checkpoint can find its turn. */
+  private readonly promptSeq = new Map<string, number>();
+  private readonly superseded: SupersededRange[] = [];
+  /** The turn currently running, if any. Rewinding across one is refused. */
+  private openTurn: string | null = null;
 
   /**
    * When the driver last did something that only a driver can do. In memory on
@@ -142,7 +173,61 @@ export class Room {
         }
         break;
       }
+
+      // ---- checkpoints (M4) ------------------------------------------------
+      case "prompt.submitted": {
+        this.promptSeq.set(b.promptId, event.seq);
+        break;
+      }
+      case "turn.started": {
+        this.openTurn = b.turnId;
+        break;
+      }
+      case "turn.completed":
+      case "turn.interrupted": {
+        if (this.openTurn === b.turnId) this.openTurn = null;
+        break;
+      }
+      case "checkpoint.created": {
+        // A rewind undoes the whole turn, prompt included, so the checkpoint
+        // starts at the prompt rather than at itself. Falling back to its own
+        // seq keeps a checkpoint usable if the prompt somehow never landed.
+        const fromSeq =
+          (b.promptId !== null ? this.promptSeq.get(b.promptId) : undefined) ??
+          event.seq;
+        this.checkpoints.set(b.checkpointId, {
+          checkpointId: b.checkpointId,
+          seq: event.seq,
+          fromSeq,
+          turnId: b.turnId,
+          label: b.label,
+          userMessageId: b.userMessageId,
+          resumeAt: b.resumeAt,
+          ts: event.ts,
+        });
+        break;
+      }
+      case "checkpoint.restored": {
+        // Nothing is removed from the log; a range of it stops counting.
+        this.superseded.push({ fromSeq: b.fromSeq, toSeq: event.seq });
+        // Checkpoints inside that range describe turns the room has abandoned.
+        // Leaving them on offer would let someone rewind to a point that no
+        // longer exists in the transcript they are looking at.
+        const abandoned = { fromSeq: b.fromSeq, toSeq: event.seq };
+        for (const [id, cp] of this.checkpoints) {
+          if (withinRange(abandoned, cp.seq)) this.checkpoints.delete(id);
+        }
+        // A rewind ends whatever turn was open; the query it belonged to is
+        // gone, so nothing will ever complete it.
+        this.openTurn = null;
+        break;
+      }
     }
+  }
+
+  /** Whether a rewind has left this event behind. */
+  isSuperseded(seq: number): boolean {
+    return isSuperseded(this.superseded, seq);
   }
 
   /**
@@ -164,9 +249,18 @@ export class Room {
    *
    * Sequence numbers are preserved on the events that survive, so clients that
    * dedupe on `seq` are unaffected by the gaps.
+   *
+   * Ranges a rewind superseded are dropped here too, so a late joiner is never
+   * sent a turn the room has already taken back. Someone who was present sees
+   * that turn and then watches it disappear when `checkpoint.restored` arrives;
+   * both end up rendering the same thing, which is the property that makes one
+   * reducer over one log worth having. `since()` stays raw — the audit export
+   * is precisely the reader that must still see what was abandoned.
    */
   compactedSince(sinceSeq: number): SessionEvent[] {
-    const events = this.since(sinceSeq);
+    const events = this.since(sinceSeq).filter(
+      (event) => !this.isSuperseded(event.seq),
+    );
 
     const finalized = new Set<string>();
     for (const event of events) {
@@ -248,6 +342,22 @@ export class Room {
 
   listPendingApprovals(): Approval[] {
     return [...this.approvals.values()].filter((a) => a.decision === null);
+  }
+
+  // ---- checkpoints --------------------------------------------------------
+
+  getCheckpoint(checkpointId: string): Checkpoint | undefined {
+    return this.checkpoints.get(checkpointId);
+  }
+
+  /** Rewindable points, oldest first. */
+  listCheckpoints(): Checkpoint[] {
+    return [...this.checkpoints.values()].sort((a, b) => a.seq - b.seq);
+  }
+
+  /** The turn in flight, if any. Rewind and fork both refuse across one. */
+  get openTurnId(): string | null {
+    return this.openTurn;
   }
 
   // ---- presence -----------------------------------------------------------

@@ -1,3 +1,4 @@
+export * from "./checkpoints.js";
 export * from "./events.js";
 export * from "./wire.js";
 

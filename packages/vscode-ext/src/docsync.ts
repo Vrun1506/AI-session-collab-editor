@@ -1,12 +1,12 @@
 import * as vscode from "vscode";
+import { applyUpdate, encodeUpdate, stateVector, textOf, Y } from "@mpa/crdt";
 import {
-  applyUpdate,
-  diffText,
-  encodeUpdate,
-  stateVector,
-  textOf,
-  Y,
-} from "@mpa/crdt";
+  decideAdoption,
+  inReverseOrder,
+  isSyncable,
+  judgeLocalChange,
+  planEdits,
+} from "./buffer-rules.js";
 
 /**
  * Two-way binding between VS Code's buffers and the room's shared documents.
@@ -16,16 +16,11 @@ import {
  * mid-sentence when a write lands. This is the part that fixes that: the text
  * lives in a CRDT, so concurrent edits merge instead of one of them winning.
  *
- * Three things make it fiddly, and all three are handled below:
- *
- *  - **Echo.** Applying a remote change produces a change event of its own. Sent
- *    back it would loop forever, so edits we are making ourselves are marked.
- *  - **Reloads.** VS Code silently rereads an unmodified file when it changes on
- *    disk. During an agent write that reload *is* the agent's change arriving by
- *    a second route; pushing it into the document would apply it twice.
- *  - **Adoption.** A file already open by someone else may hold unsaved work
- *    this window has never seen, so the shared copy wins on attach — except
- *    where that would throw away unsaved work of our own.
+ * **This file is an adapter.** The rules it applies — what may be shared, whose
+ * copy wins on attach, which buffer changes are ours to send, and how to turn
+ * one text into another — live in `buffer-rules.ts`, with no editor attached
+ * and a test each. What is left here is the part that genuinely needs VS Code:
+ * watching documents, applying workspace edits, and drawing decorations.
  */
 
 export interface DocSyncTransport {
@@ -99,18 +94,20 @@ export class DocSync implements vscode.Disposable {
 
   // ---- attaching ----------------------------------------------------------
 
-  private syncable(document: vscode.TextDocument): boolean {
-    return (
-      document.uri.scheme === "file" &&
-      !document.isUntitled &&
-      vscode.workspace.getWorkspaceFolder(document.uri) !== undefined
-    );
-  }
-
   private attach(document: vscode.TextDocument): void {
     if (this.disposed) return;
     const path = document.uri.fsPath;
-    if (this.bound.has(path) || !this.syncable(document)) return;
+    if (this.bound.has(path)) return;
+    if (
+      !isSyncable({
+        scheme: document.uri.scheme,
+        isUntitled: document.isUntitled,
+        inWorkspace:
+          vscode.workspace.getWorkspaceFolder(document.uri) !== undefined,
+      })
+    ) {
+      return;
+    }
 
     const doc = new Y.Doc();
     const bound: Bound = {
@@ -155,7 +152,7 @@ export class DocSync implements vscode.Disposable {
    *
    * `seeded` means we created it, so it already says what our buffer says and
    * anything typed since the round trip started is safely pushed on top.
-   * Otherwise somebody else's copy is authoritative and ours gives way to it.
+   * Otherwise somebody else's copy is authoritative — see `decideAdoption`.
    */
   onState(path: string, update: string, seeded: boolean): void {
     const bound = this.bound.get(path);
@@ -170,49 +167,55 @@ export class DocSync implements vscode.Disposable {
 
     const shared = bound.text.toString();
     const buffer = document.getText();
-
-    if (seeded) {
-      bound.synced = true;
-      // Push the gap, not the whole buffer: keystrokes from the last few
-      // milliseconds, if any.
-      if (shared !== buffer) {
-        bound.doc.transact(() => {
-          let drift = 0;
-          for (const hunk of diffText(shared, buffer)) {
-            const at = hunk.at + drift;
-            if (hunk.remove.length > 0) bound.text.delete(at, hunk.remove.length);
-            if (hunk.insert.length > 0) bound.text.insert(at, hunk.insert);
-            drift += hunk.insert.length - hunk.remove.length;
-          }
-        }, "local");
-      }
-      return;
-    }
-
-    if (shared === buffer) {
-      bound.synced = true;
-      return;
-    }
-
-    // Somebody else's live copy differs from ours, and we have unsaved work of
-    // our own. Adopting theirs would destroy it and imposing ours would destroy
-    // theirs, so this window stays out until the ambiguity is gone.
-    if (document.isDirty) {
-      this.detach(path);
-      this.log(
-        `not sharing ${vscode.workspace.asRelativePath(path)}: it is open ` +
-          "elsewhere with different content and you have unsaved changes. " +
-          "Save or revert to join the shared copy.",
-      );
-      void vscode.window.showWarningMessage(
-        `${vscode.workspace.asRelativePath(path)} is being edited in the shared session and your copy differs. Save or revert your changes to join it.`,
-      );
-      return;
-    }
-
-    void this.syncBufferToDoc(path, false).then(() => {
-      bound.synced = true;
+    const decision = decideAdoption({
+      seeded,
+      shared,
+      buffer,
+      isDirty: document.isDirty,
     });
+
+    switch (decision.kind) {
+      case "push-drift": {
+        bound.synced = true;
+        // Push the gap, not the whole buffer: keystrokes from the last few
+        // milliseconds, if any.
+        if (shared !== buffer) {
+          bound.doc.transact(() => {
+            for (const edit of planEdits(shared, buffer).edits) {
+              if (edit.removeLength > 0) {
+                bound.text.delete(edit.finalAt, edit.removeLength);
+              }
+              if (edit.insert.length > 0) {
+                bound.text.insert(edit.finalAt, edit.insert);
+              }
+            }
+          }, "local");
+        }
+        return;
+      }
+
+      case "already-in-sync": {
+        bound.synced = true;
+        return;
+      }
+
+      case "refuse": {
+        this.detach(path);
+        const name = vscode.workspace.asRelativePath(path);
+        this.log(`not sharing ${name}: ${decision.reason}`);
+        void vscode.window.showWarningMessage(
+          `${name} is being edited in the shared session and your copy differs. Save or revert your changes to join it.`,
+        );
+        return;
+      }
+
+      case "adopt-shared": {
+        void this.syncBufferToDoc(path, false).then(() => {
+          bound.synced = true;
+        });
+        return;
+      }
+    }
   }
 
   onUpdate(path: string, update: string, by: "peer" | "agent"): void {
@@ -240,46 +243,27 @@ export class DocSync implements vscode.Disposable {
 
   // ---- applying to the buffer ---------------------------------------------
 
-  /**
-   * Bring the buffer into line with the shared document.
-   *
-   * The obvious implementation is to replay the Yjs delta as a workspace edit,
-   * and it is wrong in one case that happens constantly: VS Code rereads an
-   * unmodified file when it changes on disk, so after an agent write the buffer
-   * may *already* contain the change by the time the merge arrives. Replaying
-   * the delta on top of it inserts the agent's code twice.
-   *
-   * Diffing what the buffer says against what the document says has no such
-   * failure. It costs a scan of the file per remote change and is idempotent by
-   * construction: a buffer that is already correct produces no edits at all.
-   */
+  /** Bring the buffer into line with the shared document. */
   private async syncBufferToDoc(path: string, fromAgent: boolean): Promise<void> {
     const bound = this.bound.get(path);
     const document = this.documentFor(path);
     if (!bound || !document) return;
 
-    const target = bound.text.toString();
-    const current = document.getText();
-    if (current === target) return;
+    const { edits, written } = planEdits(document.getText(), bound.text.toString());
+    if (edits.length === 0) return;
 
+    // Every range is resolved against the document as it is now, because
+    // `applyEdit` applies the whole set atomically against that version.
     const edit = new vscode.WorkspaceEdit();
-    const written: Array<{ at: number; length: number }> = [];
-    let drift = 0;
-
-    for (const hunk of diffText(current, target)) {
+    for (const planned of edits) {
       edit.replace(
         document.uri,
         new vscode.Range(
-          document.positionAt(hunk.at),
-          document.positionAt(hunk.at + hunk.remove.length),
+          document.positionAt(planned.at),
+          document.positionAt(planned.at + planned.removeLength),
         ),
-        hunk.insert,
+        planned.insert,
       );
-      if (hunk.insert.length > 0) {
-        // Highlights are drawn against the document as it will be.
-        written.push({ at: hunk.at + drift, length: hunk.insert.length });
-      }
-      drift += hunk.insert.length - hunk.remove.length;
     }
 
     bound.applying++;
@@ -315,24 +299,19 @@ export class DocSync implements vscode.Disposable {
   private onLocalChange(event: vscode.TextDocumentChangeEvent): void {
     const path = event.document.uri.fsPath;
     const bound = this.bound.get(path);
-    if (!bound || !bound.synced || event.contentChanges.length === 0) return;
+    if (!bound) return;
 
-    // Our own application of a remote change, coming back around.
-    if (bound.applying > 0) return;
-
-    // While the agent is writing this file, a change that leaves the buffer
-    // clean is VS Code rereading it from disk — the same edit we are about to
-    // receive as a merge. Applying both would insert the agent's text twice.
-    if (bound.locked && !event.document.isDirty) return;
-
-    // Later changes in one event are positioned against the document as it was
-    // before any of them, so they are applied last first.
-    const changes = [...event.contentChanges].sort(
-      (a, b) => b.rangeOffset - a.rangeOffset,
-    );
+    const verdict = judgeLocalChange({
+      synced: bound.synced,
+      changeCount: event.contentChanges.length,
+      applying: bound.applying,
+      locked: bound.locked,
+      isDirty: event.document.isDirty,
+    });
+    if (!verdict.push) return;
 
     bound.doc.transact(() => {
-      for (const change of changes) {
+      for (const change of inReverseOrder(event.contentChanges)) {
         if (change.rangeLength > 0) {
           bound.text.delete(change.rangeOffset, change.rangeLength);
         }

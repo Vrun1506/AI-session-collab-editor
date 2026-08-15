@@ -30,6 +30,13 @@
  *                      rewrite this text the instant the agent starts writing.
  *                      Aim it at the lines the agent is about to change and the
  *                      merge should report a conflict rather than overwrite you
+ *
+ * Checkpoints, rewind and fork (M4):
+ *   MPA_REWIND_AFTER=1 rewind to the checkpoint that opened the turn as soon as
+ *                      that turn completes — the whole undo cycle in one run
+ *   MPA_FORK_AFTER=name
+ *                      fork that same checkpoint into a new room instead
+ *   MPA_AUDIT=1        ask for the audit log and print it before exiting
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -67,8 +74,17 @@ const openPaths = (process.env.MPA_OPEN ?? "")
 const unsavedText = process.env.MPA_UNSAVED;
 const typeOnLock = process.env.MPA_TYPE_ON_LOCK;
 const replaceOnLock = (process.env.MPA_REPLACE_ON_LOCK ?? "").split(">>");
+const rewindAfter = flag("MPA_REWIND_AFTER");
+const forkAfter = process.env.MPA_FORK_AFTER?.trim();
+const wantsAudit = flag("MPA_AUDIT");
 
 let driving = false;
+/**
+ * The most recent checkpoint, which is the one a scripted run wants: rewinding
+ * "the turn that just happened" is the case worth being able to reproduce in
+ * one command.
+ */
+let lastCheckpointId: string | null = null;
 
 const socket = new WebSocket(relayUrl);
 const send = (msg: ClientMessage) => socket.send(encode(msg));
@@ -117,6 +133,26 @@ function render(event: SessionEvent, replay: boolean): void {
     console.log(
       `[${tag}] ✅ turn done — cost $${(u.costUsd ?? 0).toFixed(4)} (room $${roomCostUsd.toFixed(4)}), ${u.durationMs}ms`,
     );
+    // Rewind and fork are both refused while a turn is in flight, so this is
+    // the first moment either can be asked for.
+    if (!replay && driving && lastCheckpointId) {
+      if (rewindAfter) {
+        console.log(`[${name}] ⏪ rewinding to ${lastCheckpointId}`);
+        send({ type: "rewindTo", checkpointId: lastCheckpointId });
+      } else if (forkAfter) {
+        console.log(`[${name}] 🌿 forking into ${forkAfter}`);
+        send({
+          type: "forkRoom",
+          checkpointId: lastCheckpointId,
+          toRoomId: forkAfter,
+        });
+      }
+    }
+    // With a rewind or fork pending, the interesting audit is the one *after*
+    // it, so those request it themselves once their event lands.
+    if (!replay && wantsAudit && !rewindAfter && !forkAfter) {
+      send({ type: "requestAudit" });
+    }
     return;
   }
   if (isEvent(event, "prompt.submitted")) {
@@ -197,6 +233,46 @@ function render(event: SessionEvent, replay: boolean): void {
     );
     return;
   }
+
+  // ---- checkpoints, rewind and fork ---------------------------------------
+  if (isEvent(event, "checkpoint.created")) {
+    lastCheckpointId = event.body.checkpointId;
+    console.log(`[${tag}] 📍 checkpoint: ${event.body.label}`);
+    return;
+  }
+  if (isEvent(event, "checkpoint.restored")) {
+    const b = event.body;
+    console.log(
+      `[${tag}] ⏪ ${who} rewound to "${b.label}" — ` +
+        `${b.filesChanged.length} file(s) restored (+${b.insertions}/-${b.deletions})` +
+        (b.skippedLinks
+          ? `, ⚠️ ${b.skippedLinks} refused as unsafe links`
+          : "") +
+        `, now in session ${b.sessionId ?? "(fresh)"}`,
+    );
+    // Everything from fromSeq up to here is superseded — this is where a
+    // client's transcript drops the turn it just watched happen.
+    console.log(`[${tag}]    superseded seq ${b.fromSeq}..${event.seq - 1}`);
+    if (wantsAudit) send({ type: "requestAudit" });
+    return;
+  }
+  if (isEvent(event, "checkpoint.failed")) {
+    console.log(`[${tag}] ⚠️  rewind failed — ${event.body.reason}`);
+    return;
+  }
+  if (isEvent(event, "room.forked")) {
+    const b = event.body;
+    console.log(
+      `[${tag}] 🌿 ${who} forked "${b.label}" at seq ${b.atSeq} ` +
+        (b.toRoomId
+          ? `into room "${b.toRoomId}" (this room carries on)`
+          : `from room "${b.fromRoomId}"`) +
+        ` — session ${b.sessionId ?? "(fresh)"}`,
+    );
+    if (wantsAudit) send({ type: "requestAudit" });
+    return;
+  }
+
   console.log(`[${tag}] ${event.body.type} (${who})`);
 }
 
@@ -341,6 +417,12 @@ socket.on("message", (raw) => {
         console.log(`[${name}] ✍️  rewrote "${from}" while the agent was writing`);
       }
     }
+    return;
+  }
+  if (msg.type === "auditReport") {
+    console.log(`\n===== audit log for ${msg.roomId} =====`);
+    console.log(msg.markdown);
+    console.log(`===== end of audit log =====\n`);
     return;
   }
   if (msg.type === "error") {

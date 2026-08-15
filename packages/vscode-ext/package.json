@@ -46,6 +46,21 @@
         "category": "Multiplayer Agent"
       },
       {
+        "command": "mpa.rewind",
+        "title": "Multiplayer Agent: Rewind to a Checkpoint",
+        "category": "Multiplayer Agent"
+      },
+      {
+        "command": "mpa.forkSession",
+        "title": "Multiplayer Agent: Fork Session into a New Room",
+        "category": "Multiplayer Agent"
+      },
+      {
+        "command": "mpa.exportAudit",
+        "title": "Multiplayer Agent: Export Audit Log",
+        "category": "Multiplayer Agent"
+      },
+      {
         "command": "mpa.stopAgent",
         "title": "Multiplayer Agent: Stop Shared Agent (ends it for everyone)",
         "category": "Multiplayer Agent"
@@ -105,7 +120,8 @@
   "scripts": {
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.test.json && node scripts/prep-tests.mjs && node --test \"dist/**/*.test.js\""
   },
   "dependencies": {
     "@mpa/crdt": "workspace:*",

@@ -192,6 +192,7 @@ async function startSession(
       onDocSave: (path) => void docSync?.onSaveRequest(path),
       onDocLock: (path, locked) => docSync?.onLock(path, locked),
       onResync: () => docSync?.reattachAll(),
+      onAuditReport: (id, markdown) => void showAudit(id, markdown),
     },
   );
   session.start();
@@ -223,6 +224,51 @@ async function startSession(
   );
 }
 
+/**
+ * The audit log opens as an unsaved document rather than being written
+ * somewhere. Where it should live is the reader's decision — a compliance
+ * folder, a ticket, a message — and guessing a path would only mean deleting a
+ * file afterwards.
+ */
+async function showAudit(roomId: string, markdown: string): Promise<void> {
+  const doc = await vscode.workspace.openTextDocument({
+    content: markdown,
+    language: "markdown",
+  });
+  await vscode.window.showTextDocument(doc, { preview: false });
+  void vscode.window.showInformationMessage(
+    `Audit log for “${roomId}” — save it wherever it belongs.`,
+  );
+}
+
+/** Offer the room's rewind points, newest first. */
+async function pickCheckpoint(
+  placeHolder: string,
+): Promise<string | undefined> {
+  if (!session) {
+    void vscode.window.showInformationMessage("No shared session is running.");
+    return undefined;
+  }
+  const checkpoints = session.listCheckpoints();
+  if (checkpoints.length === 0) {
+    void vscode.window.showInformationMessage(
+      "No checkpoints yet — one is recorded at the start of every turn.",
+    );
+    return undefined;
+  }
+
+  const pick = await vscode.window.showQuickPick(
+    checkpoints.map((c) => ({
+      label: c.label || "(no prompt text)",
+      description: new Date(c.ts).toLocaleTimeString(),
+      detail: `seq ${c.seq}`,
+      checkpointId: c.checkpointId,
+    })),
+    { placeHolder, ignoreFocusOut: true },
+  );
+  return pick?.checkpointId;
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand("mpa.hostSession", () =>
@@ -242,6 +288,45 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("mpa.releaseDriver", () =>
       session?.releaseDriver(),
     ),
+    vscode.commands.registerCommand("mpa.rewind", async () => {
+      const checkpointId = await pickCheckpoint("Take the room back to…");
+      if (!checkpointId) return;
+      // Modal, because this restores files on the host's disk for everyone in
+      // the room, not just the person who clicked.
+      const pick = await vscode.window.showWarningMessage(
+        "Rewind the shared session to this checkpoint? Files the agent changed since then are restored, for everyone. Anything people typed themselves is left alone.",
+        { modal: true },
+        "Rewind",
+      );
+      if (pick === "Rewind") session?.rewindTo(checkpointId);
+    }),
+    vscode.commands.registerCommand("mpa.forkSession", async () => {
+      const checkpointId = await pickCheckpoint("Branch a new room from…");
+      if (!checkpointId) return;
+      const toRoomId = (
+        await vscode.window.showInputBox({
+          prompt: "Name for the new room",
+          placeHolder: "e.g. demo-alt",
+          ignoreFocusOut: true,
+          validateInput: (v) =>
+            v.trim().length === 0 ? "The new room needs a name" : null,
+        })
+      )?.trim();
+      if (!toRoomId) return;
+      session?.forkRoom(checkpointId, toRoomId);
+      void vscode.window.showInformationMessage(
+        `Forking into “${toRoomId}”. This room keeps running — join the new one to pick up the other branch.`,
+      );
+    }),
+    vscode.commands.registerCommand("mpa.exportAudit", () => {
+      if (!session) {
+        void vscode.window.showInformationMessage(
+          "No shared session is running.",
+        );
+        return;
+      }
+      session.requestAudit();
+    }),
     vscode.commands.registerCommand("mpa.stopAgent", async () => {
       const pick = await vscode.window.showWarningMessage(
         "Stop the shared agent? This ends the session for everyone in the room.",

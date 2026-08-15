@@ -237,6 +237,92 @@ export const EventBody = z.discriminatedUnion("type", [
     /** Who had the file open, so the transcript says whose buffer changed. */
     holders: z.array(z.string()),
   }),
+
+  // ---- checkpoints, rewind and fork (M4) -----------------------------------
+  /**
+   * A point the room can be taken back to: one per turn, recorded when the turn
+   * starts.
+   *
+   * Rewinding has to move three things that are keyed differently — the
+   * transcript (our `seq`), the files on disk and the agent's memory (both the
+   * SDK's message UUIDs) — and nothing else bridges those two id spaces. That
+   * is the entire reason this event exists: it is the join row.
+   *
+   * `promptId` rather than a sequence number because the agent-host publishes
+   * this and only the relay knows `seq`; the room resolves it when folding.
+   */
+  z.object({
+    type: z.literal("checkpoint.created"),
+    checkpointId: z.string(),
+    turnId: z.string().nullable(),
+    promptId: z.string().nullable(),
+    /** Human label, derived from the prompt that opened the turn. */
+    label: z.string(),
+    /** SDK uuid of the prompt. `rewindFiles` restores files to this point. */
+    userMessageId: z.string(),
+    /**
+     * SDK uuid of the last chain entry *before* this turn, for
+     * `resumeSessionAt`. Null on the room's first turn, which rewinds to a
+     * session with no history rather than to a point inside one.
+     */
+    resumeAt: z.string().nullable(),
+  }),
+
+  /**
+   * The room was taken back to a checkpoint.
+   *
+   * Nothing is deleted. The log stays append-only and this event declares a
+   * range of it superseded, which is what keeps "what actually happened" and
+   * "what the room is working from now" both answerable — the transcript hides
+   * the abandoned range, the audit export still shows it.
+   */
+  z.object({
+    type: z.literal("checkpoint.restored"),
+    checkpointId: z.string(),
+    label: z.string(),
+    /** Events from here up to this event are superseded. */
+    fromSeq: z.number().int(),
+    /** Files the SDK put back, and by how much. */
+    filesChanged: z.array(z.string()),
+    insertions: z.number().int(),
+    deletions: z.number().int(),
+    /**
+     * Files the SDK refused to restore because a symlink or a moved parent
+     * directory made it unsafe. Surfaced because a rewind that silently left
+     * some files rewritten is worse than one that failed outright.
+     */
+    skippedLinks: z.number().int(),
+    /** The session the room continues in — a fork, so the old one is intact. */
+    sessionId: z.string().nullable(),
+  }),
+
+  /** A rewind that could not be completed, kept in the log because a failed
+   *  rewind leaves the room in a state somebody has to reason about. */
+  z.object({
+    type: z.literal("checkpoint.failed"),
+    checkpointId: z.string(),
+    reason: z.string(),
+  }),
+
+  /**
+   * A checkpoint was branched into a room of its own, leaving this one running.
+   *
+   * The fork copies the log up to the checkpoint and forks the agent's session
+   * at the same point, so the new room's agent remembers everything the old one
+   * did up to the branch and nothing after it.
+   */
+  z.object({
+    type: z.literal("room.forked"),
+    checkpointId: z.string(),
+    label: z.string(),
+    /** The room created. `fromRoomId` on the event in the *new* room's log. */
+    toRoomId: z.string().optional(),
+    fromRoomId: z.string().optional(),
+    /** Log position the branch was taken at: the new room holds seq < this. */
+    atSeq: z.number().int(),
+    /** The forked SDK session, or null when branching from before any turn. */
+    sessionId: z.string().nullable(),
+  }),
 ]);
 export type EventBody = z.infer<typeof EventBody>;
 

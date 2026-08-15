@@ -26,31 +26,81 @@ function contentToText(content: unknown): string {
   return JSON.stringify(content);
 }
 
+/** The uuid the SDK assigned a transcript entry, where it has one. */
+function entryUuid(msg: SDKMessage): string | undefined {
+  return "uuid" in msg && typeof msg.uuid === "string" ? msg.uuid : undefined;
+}
+
 /**
  * Converts the SDK's message stream into shared-log events.
  *
  * Holds the small amount of state the conversion needs: which turn is open,
- * which assistant message the current deltas belong to, and the previous
- * cumulative cost (so each turn can report its own cost rather than the
- * session running total).
+ * which assistant message the current deltas belong to, the previous cumulative
+ * cost (so each turn can report its own cost rather than the session running
+ * total), and — for M4 — where each turn sits in the SDK's own transcript.
+ *
+ * That last part is the only place the two id spaces meet. Our log is ordered
+ * by the relay's `seq`; `rewindFiles` and `resumeSessionAt` are addressed by SDK
+ * message uuid. A checkpoint has to carry both or a rewind can move the
+ * transcript without moving the files and the agent's memory with it.
  */
 export class TurnTranslator {
   private turnId: string | null = null;
   private messageId = "pending";
   private lastTotalCostUsd = 0;
 
-  startTurn(turnId: string): void {
+  // ---- checkpoint anchoring (M4) -------------------------------------------
+  /** The most recent chain entry, whichever kind it was. */
+  private lastEntry: string | null = null;
+  /** What `lastEntry` was when this turn opened: the last entry to keep. */
+  private resumeAt: string | null = null;
+  private promptId: string | null = null;
+  private label = "";
+  /** Whether this turn's prompt echo has been seen and its checkpoint emitted. */
+  private anchored = true;
+
+  startTurn(turnId: string, promptId: string | null = null, label = ""): void {
     this.turnId = turnId;
     this.messageId = "pending";
+    // Captured before the prompt enters the transcript, so it names the last
+    // entry that survives if this turn is later taken back.
+    this.resumeAt = this.lastEntry;
+    this.promptId = promptId;
+    this.label = label;
+    this.anchored = false;
   }
 
   get openTurnId(): string | null {
     return this.turnId;
   }
 
+  /**
+   * Point the translator at a session that has just been rewound.
+   *
+   * Two things have to move together. `lastEntry` becomes the truncation point,
+   * because the entries after it no longer exist in the forked transcript and a
+   * checkpoint anchored to one would be unresumable. And the cost baseline goes
+   * back to zero, because `total_cost_usd` is per-session and the fork is a new
+   * session — leaving it would make the next turn look free until the running
+   * total climbed back past the old one.
+   */
+  resetTo(entryUuid: string | null): void {
+    this.lastEntry = entryUuid;
+    this.resumeAt = entryUuid;
+    this.turnId = null;
+    this.anchored = true;
+    this.lastTotalCostUsd = 0;
+  }
+
   translate(msg: SDKMessage): EventBody[] {
     const turnId = this.turnId ?? "orphan";
     const out: EventBody[] = [];
+
+    // Every entry that lands in the SDK transcript can be a fork point, so the
+    // running "last entry" is tracked for all of them rather than only the
+    // kinds this translator turns into events.
+    const uuid = entryUuid(msg);
+    if (uuid) this.lastEntry = uuid;
 
     switch (msg.type) {
       case "system": {
@@ -126,8 +176,34 @@ export class TurnTranslator {
       }
 
       case "user": {
-        // Tool results arrive as synthetic user messages.
         const content = msg.message?.content;
+        const isToolResult =
+          Array.isArray(content) &&
+          content.some(
+            (block) =>
+              block &&
+              typeof block === "object" &&
+              "type" in block &&
+              block.type === "tool_result",
+          );
+
+        // The prompt coming back with a uuid on it is the one moment the SDK
+        // tells us where this turn begins in its own transcript. Tool results
+        // arrive as user messages too, hence the check rather than the type.
+        if (!isToolResult && uuid && !this.anchored) {
+          this.anchored = true;
+          out.push({
+            type: "checkpoint.created",
+            checkpointId: uuid,
+            turnId: this.turnId,
+            promptId: this.promptId,
+            label: this.label,
+            userMessageId: uuid,
+            resumeAt: this.resumeAt,
+          });
+        }
+
+        // Tool results arrive as synthetic user messages.
         if (!Array.isArray(content)) break;
         for (const block of content) {
           if (

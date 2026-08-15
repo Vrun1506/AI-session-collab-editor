@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { EventDraft, SessionEvent } from "./events.js";
+import { EventDraft, Identity, SessionEvent } from "./events.js";
 
 /**
  * Wire protocol between the relay and everything else. Two kinds of peer
@@ -175,6 +175,43 @@ export const ClientMessage = z.discriminatedUnion("type", [
     turnId: z.string().nullable(),
   }),
 
+  // ---- checkpoints, rewind and fork (M4) -----------------------------------
+  /**
+   * Driver -> relay: take the room back to this checkpoint.
+   *
+   * Refused while a turn is in flight. Rewinding underneath a running agent
+   * would race its own writes against the restore, and the honest fix is to
+   * make the caller interrupt first rather than to guess which should win.
+   */
+  z.object({ type: z.literal("rewindTo"), checkpointId: z.string() }),
+  /**
+   * Driver -> relay: branch this checkpoint into a new room, leaving this one
+   * as it is. The obvious move after an agent goes down the wrong path with
+   * work worth keeping on both sides of the decision.
+   */
+  z.object({
+    type: z.literal("forkRoom"),
+    checkpointId: z.string(),
+    toRoomId: z.string().min(1),
+  }),
+  /** Anyone -> relay: render this room's audit log. */
+  z.object({ type: z.literal("requestAudit") }),
+  /**
+   * agent-host -> relay: the outcome of a `doFork`.
+   *
+   * Rewind needs no equivalent — the host publishes `checkpoint.restored`
+   * straight into the log. A fork does, because it produces a session for a
+   * room that has no agent-host of its own yet, and only the relay can put it
+   * somewhere the future one will find it.
+   */
+  z.object({
+    type: z.literal("forkedSession"),
+    checkpointId: z.string(),
+    toRoomId: z.string(),
+    sessionId: z.string().nullable(),
+    error: z.string().optional(),
+  }),
+
   z.object({ type: z.literal("ping") }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
@@ -276,6 +313,46 @@ export const ServerMessage = z.discriminatedUnion("type", [
     applied: z.number().int(),
     moved: z.number().int(),
     conflicts: z.number().int(),
+  }),
+
+  // ---- checkpoints, rewind and fork (M4) -----------------------------------
+  /**
+   * Relay -> agent-host: put the files and your own memory back to this point.
+   *
+   * The relay decides *whether* a rewind may happen and the host decides *how*,
+   * because everything that can actually move — the file backups and the
+   * session transcript — lives behind the SDK, on the host's machine.
+   */
+  z.object({
+    type: z.literal("doRewind"),
+    checkpointId: z.string(),
+    label: z.string(),
+    /** `Query.rewindFiles` anchor: restore files to their state here. */
+    userMessageId: z.string(),
+    /** `resumeSessionAt` anchor: the last entry to keep. Null = start clean. */
+    resumeAt: z.string().nullable(),
+    /** Echoed back on `checkpoint.restored` so the room knows what it hid. */
+    fromSeq: z.number().int(),
+    /**
+     * Who asked. Carried so the host can attribute the restore to them rather
+     * than to the agent — "the agent rewound itself" is not what happened, and
+     * an audit log that says so is worse than useless.
+     */
+    requestedBy: Identity,
+  }),
+  /** Relay -> agent-host: branch the session, and tell me the new id. */
+  z.object({
+    type: z.literal("doFork"),
+    checkpointId: z.string(),
+    toRoomId: z.string(),
+    /** Fork point, inclusive. Null when branching from before the first turn. */
+    upToMessageId: z.string().nullable(),
+  }),
+  /** Relay -> peer: the rendered audit log for this room. */
+  z.object({
+    type: z.literal("auditReport"),
+    roomId: z.string(),
+    markdown: z.string(),
   }),
 
   z.object({ type: z.literal("pong") }),

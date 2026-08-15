@@ -2,5 +2,10 @@ src/**
 node_modules/**
 esbuild.mjs
 tsconfig.json
+tsconfig.test.json
+scripts/**
+# Compiled test output. `out/extension.js` is what ships; `dist/` exists only so
+# the pure rules can be run under `node --test`.
+dist/**
 **/*.map
 **/*.ts

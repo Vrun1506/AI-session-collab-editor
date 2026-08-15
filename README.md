@@ -9,8 +9,9 @@ folded from that log, so someone joining ten minutes late sees exactly what
 everyone else sees.
 
 Status: **working MVP** — several people share one agent that can read, run
-commands and change code, with concurrency control, live shared buffers and an
-auth gate. See `Milestones`.
+commands and change code, with concurrency control, live shared buffers, an auth
+gate, and a session that can be rewound, forked and exported for audit. See
+`Milestones`.
 
 ## Architecture
 
@@ -35,7 +36,7 @@ lets it move into a cloud sandbox later without touching any client.
 | --- | --- |
 | `packages/protocol` | zod schemas for the event log and wire protocol — the contract |
 | `packages/crdt` | shared text: hunk diffing, and merging an agent write into a document people are typing in |
-| `packages/sync-server` | WebSocket relay, event log, replay, live documents |
+| `packages/sync-server` | WebSocket relay, event log, replay, live documents, audit export |
 | `packages/agent-host` | Agent SDK wrapper: prompt queue, event translation |
 | `packages/vscode-ext` | Extension + shared agent panel webview |
 
@@ -43,6 +44,10 @@ Two seams are load-bearing for where this goes next. `EventStore` keeps SQLite
 swappable for Postgres when rooms outgrow one machine, and `Authenticator` keeps
 the shared token swappable for real accounts when the relay stops being
 something you run on your laptop.
+
+**Adding to this?** [`ARCHITECTURE.md`](ARCHITECTURE.md) has the seams, recipes
+for the three recurring changes (a new event type, a new wire message, a new
+client affordance), and an honest list of what is still awkward.
 
 ## Prerequisites
 
@@ -295,6 +300,134 @@ model, and should be run after any SDK upgrade.
 | `MPA_WRITE_GRACE_MS` | how long a path stays marked "the agent is writing this" after the merge, to cover a late reload (default 1.5s) |
 | `MPA_WRITE_LOCK_TIMEOUT_MS` | backstop release for a write that never reported (default 60s) |
 
+## Checkpoints, rewind and fork
+
+A **checkpoint** is recorded at the start of every turn. Nobody creates them by
+hand: the turn is the unit people actually want back, because the thing that
+goes wrong is a prompt, and everything that followed it.
+
+Rewinding has to move three things that are keyed three different ways, and
+moving any two of them is worse than moving none:
+
+| What | Keyed by | Moved by |
+| --- | --- | --- |
+| The transcript | our `seq` | superseding a range of the log |
+| The files on disk | SDK message uuid | `Query.rewindFiles()` |
+| The agent's memory | SDK message uuid | `resumeSessionAt` + `forkSession` |
+
+That is the whole reason `checkpoint.created` exists: it is the join row between
+our sequence numbers and the SDK's message uuids, and nothing else bridges them.
+
+**None of the hard part is ours.** File restoration comes from the SDK's own
+pre-write backups (`enableFileCheckpointing`, now always on) and the memory
+rewind is its own transcript truncation. `packages/agent-host/probe-rewind.mjs`
+checks all three assumptions and should be run after any SDK upgrade:
+
+```bash
+cd packages/agent-host && node probe-rewind.mjs
+```
+
+### Nothing is deleted
+
+The log stays append-only. A rewind appends `checkpoint.restored`, which
+declares the range from the checkpoint's *prompt* up to itself **superseded** —
+so the room stops counting it without losing it.
+
+That split is deliberate, and it is why there are two readers:
+
+- **The transcript** folds the compacted log, so a rewound turn disappears.
+  Someone who watched it happen sees it removed; someone joining afterwards is
+  never sent it. Both end up looking at the same thing.
+- **The audit export** reads the raw log, so the abandoned turn is still there.
+  It ran, it spent money and it may have touched files, and a record that
+  quietly dropped it would be worse than no record.
+
+Rewinding is refused while a turn is in flight — restoring files underneath a
+running agent races its own writes, and there is no correct winner, so the
+caller has to interrupt first. Only the driver may do it.
+
+```
+⏪ alice rewound the session to "make the login form accessible" ·
+   3 file(s) restored (+0/-47)
+```
+
+### What a rewind does not undo
+
+- **Only files the agent changed.** The SDK backs up what it is about to write,
+  so that is exactly the set that comes back. **Anything people typed
+  themselves is left alone** — deliberately: an "undo" that reverted a
+  colleague's work because it shared a file with the agent's would be a much
+  worse failure than the one it fixed.
+- **Files it cannot safely restore are reported, not skipped quietly.** If a
+  symlink or a moved parent directory appears where a tracked file was, the SDK
+  refuses that file and `skippedLinks` says how many, because a rewind that
+  half-happened is the state most worth knowing about.
+- **Money already spent.** The audit still bills the abandoned turn.
+- **The old branch is not destroyed.** The rewind *forks* the SDK session rather
+  than truncating it, so the abandoned conversation is still on disk and a
+  rewind someone regrets is recoverable by hand.
+
+### Forking a session
+
+When the agent goes down the wrong path but the work is worth keeping on both
+sides of the decision, fork the checkpoint into a room of its own:
+
+```
+🌿 alice forked "try the CSS grid approach" into room demo-alt — this room carries on
+```
+
+The log prefix is copied up to the branch point and the agent's session is
+forked at the same place, so the new room's agent remembers everything up to the
+branch and nothing after it. Sequence numbers are carried over rather than
+renumbered, so a checkpoint means the same thing in both logs.
+
+Two things to know:
+
+- The new room needs **its own agent-host**. Host or join `demo-alt` and one
+  starts; from the CLI, `MPA_ROOM=demo-alt`.
+- **A fork carries no file history** — the SDK does not copy backups into a
+  forked session — so the new room can rewind to its own turns but not back
+  past the branch point.
+
+### Audit export
+
+```bash
+node packages/sync-server/dist/audit-cli.js              # list rooms
+node packages/sync-server/dist/audit-cli.js demo         # markdown
+node packages/sync-server/dist/audit-cli.js demo --json  # structured
+node packages/sync-server/dist/audit-cli.js demo -o audit.md
+```
+
+Reading the database rather than asking a running relay is the point: the moment
+anyone needs this — a bad write, a command nobody remembers approving, a bill
+worth arguing about — is exactly the moment the session is over and the relay is
+not running.
+
+The report folds prompts and who authored them, every tool call with its
+arguments and who allowed or denied it, files changed and how the merge landed,
+rewinds, forks, and spend attributed to whoever's prompt started each turn
+(**for a promoted suggestion that is its author, not the driver who ran it**).
+It ends with a section stating what it does *not* contain, because an audit
+trail that implies completeness it does not have is the one failure mode worth
+designing against.
+
+**Multiplayer Agent: Export Audit Log** opens the same thing in an editor tab.
+
+### Trying it without VS Code
+
+```bash
+# Alice drives, approves, and rewinds the turn as soon as it finishes.
+MPA_ROOM=demo MPA_DRIVE=1 MPA_AUTOAPPROVE=1 \
+  MPA_REWIND_AFTER=1 MPA_AUDIT=1 \
+  node packages/sync-server/dist/test-client.js alice \
+  "Add a comment to the top of src/login.ts"
+```
+
+Watch the file change, then change back, and the audit print the turn it just
+took back. `MPA_FORK_AFTER=demo-alt` branches instead of rewinding. Join the
+same room with a second client afterwards to confirm a late joiner is never
+sent the abandoned turn.
+
 ## Auth
 
 The relay listens on **loopback only** by default, and requires a token.
@@ -361,8 +494,13 @@ shadowing the gate has to avoid — the SDK warns about this, and it is why laye
 - **M2 ✅** driver token, suggestion queue, shared approval gate
 - **MVP ✅** agent writes with lost-update protection, one-command start, auth
 - **M3 ✅** CRDT buffers: people and the agent edit the same live document
-- **M4** checkpoint rewind, session fork, audit export
+- **M4 ✅** checkpoint rewind, session fork, audit export
+- **Desktop app** ship as a VS Code fork rather than an extension, so there is
+  an installer instead of "build the repo and keep it on disk"
 - **Hosting** relay on a server, TLS, real accounts, org-level billing
+
+Open work — including the one probe that has never been run — is tracked in
+[`TASKS.md`](TASKS.md).
 
 ## Tests and measurement
 
@@ -379,17 +517,24 @@ pnpm typecheck
 node tools/count-frames.mjs "In exactly 200 words, explain event sourcing."
 ```
 
-Two probes check assumptions about the SDK that the design rests on, and both
+Three probes check assumptions about the SDK that the design rests on, and all
 should be re-run after an upgrade:
 
 ```bash
 cd packages/agent-host
 node probe-gate.mjs deny   # a denied tool call must NOT execute
 node probe-posttool.mjs    # PostToolUse additionalContext must reach the model
+node probe-rewind.mjs      # prompt uuids, rewindFiles, forkSession
 ```
 
 The second is what lets the agent be told that part of its edit did not land.
 Without that channel it reports success for work it did not do.
+
+The third covers M4, where the load-bearing behaviour is entirely the SDK's:
+prompts must come back through the stream carrying a `uuid` (or a checkpoint has
+nothing to anchor to), `rewindFiles` must actually restore a file (or a rewind
+rolls back the transcript and leaves the edits on disk), and a forked session
+must be resumable (or a fork produces a room whose agent remembers nothing).
 
 `count-frames.mjs` exists because an assumption cost real work. A buffering layer was added to
 the agent-host to coalesce "per-token" deltas; measurement showed this SDK
